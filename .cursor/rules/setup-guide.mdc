@@ -1,0 +1,230 @@
+---
+description: Guides new project setup when project.yaml has an empty project name
+globs:
+  - project.yaml
+alwaysApply: true
+---
+
+# Rowan County Web App Template - Setup Guide
+
+## When This Rule Activates
+
+This rule applies when the project has not yet been configured. Check by reading `project.yaml` -- if `project.name` is empty, the project needs setup.
+
+## Your Role
+
+You are guiding a Rowan County developer through setting up a new web application from this template. Be conversational, suggest defaults based on what you can infer, and ask only for information you cannot determine yourself.
+
+The goal is: **idea to deployable web app in ~15 minutes** with proper auth, Cloudflare tunnels, and correct infrastructure (Portainer stacks) -- just by answering questions.
+
+## Setup Flow
+
+Follow the steps below in order. For each step:
+
+1. Explain what the step does and why (briefly)
+2. Check for required tools right before the step that needs them (not upfront)
+3. Infer or suggest defaults where possible
+4. Ask the user to confirm or provide values
+5. Execute the step (or guide manual completion)
+6. Update `project.yaml` when the step is complete
+
+**Do NOT list all prerequisites upfront.** Check for each tool incrementally as it becomes relevant.
+
+## Step-by-Step Behavior
+
+### Step 1: Project Identity
+
+- Infer the project slug from the git remote URL or directory name (e.g., `permit-tracker` from `rowan-permit-tracker`)
+- Suggest a display name by converting the slug to title case (e.g., `Permit Tracker`)
+- **Port conflict check**: Before suggesting port 5001, run a port check:
+  - Windows: `powershell -Command "Get-NetTCPConnection -LocalPort 5001 -ErrorAction SilentlyContinue"`
+  - macOS/Linux: `lsof -i :5001 2>/dev/null`
+  - If port 5001 is in use, suggest the next available port (5002, 5003, etc.) and check that one too
+- Write confirmed values to `project.yaml`
+
+### Step 2: Environment Model
+
+- Ask: "Will your dev environment be **local only** (you develop on localhost), or do you want a **deployed dev environment** with its own URL, tunnel, and Portainer stack?"
+- If deployed dev: suggest URLs using the pattern `{slug}.rowancountync.io` (prod) and `{slug}-dev.rowancountync.io` (dev)
+- If local only: only ask for the production URL; dev uses `localhost:{port}`
+- Write to `project.yaml`
+
+### Step 3: Cloudflare Tunnels
+
+**Why this comes before auth:** The Azure app registration needs the public URL for its callback URI. Establishing the Cloudflare tunnel first confirms the exact URLs.
+
+- Check if `.operator.env` exists and has `CLOUDFLARE_API_TOKEN` and `CLOUDFLARE_ACCOUNT_ID`
+- **If Cloudflare API credentials are available:** offer to create tunnel(s) via API
+- **If no API credentials (most common):** ask the user directly:
+  - "Do you already have a Cloudflare tunnel set up, or do you need to create one?"
+  - If they need to create one, walk them through it:
+    1. Go to [Cloudflare Zero Trust](https://one.dash.cloudflare.com/) > Networks > Tunnels
+    2. Click "Create a tunnel" > choose "Cloudflared" connector
+    3. Name it `{slug}` (for prod) or `{slug}-dev` (for dev)
+    4. Copy the tunnel token (the long `eyJ...` string)
+    5. Add a public hostname: hostname = `{slug}.rowancountync.io`, service = `http://webapp:{port}`
+  - If they already have one: ask for the **tunnel token** and **public hostname** for prod (and dev if applicable)
+- Naming convention: `{slug}` for prod tunnel, `{slug}-dev` for dev tunnel
+- Record: tunnel token(s) and confirmed public URL(s) for later steps
+- Update `project.yaml` with confirmed URLs
+
+### Step 4: Azure App Registration (Auth)
+
+- **Tool check:** Run `az --version` to check if Azure CLI is installed
+  - If NOT installed, offer to help:
+    - Windows: `winget install -e --id Microsoft.AzureCLI`
+    - macOS: `brew install azure-cli`
+    - Or direct download: https://learn.microsoft.com/en-us/cli/azure/install-azure-cli
+  - After install, run `az login` and select the "Rowan County Monthly" subscription
+  - If they can't install `az` right now, provide manual Azure Portal instructions instead
+- **If `az` is available:** check login status with `az account show`. If not logged in, run `az login`.
+- Ask: "Should dev and prod share the same Azure app registration, or use separate ones?" (Shared is simpler; separate is more isolated)
+- Use the **confirmed URLs from Step 3** for the redirect URIs:
+  - Prod: `https://{prod-url}/getAToken`
+  - Dev: `https://{dev-url}/getAToken` (or `http://localhost:{port}/getAToken` if local-only dev)
+- **Automated (if `az` available):**
+  ```
+  az ad app create --display-name "{Display Name}" --web-redirect-uris "https://{url}/getAToken" --sign-in-audience "AzureADMyOrg"
+  az ad app credential reset --id {APP_ID} --display-name "prod-secret"
+  ```
+- **Manual (if no `az`):**
+  1. Go to [Azure Portal > App registrations](https://portal.azure.com/#view/Microsoft_AAD_RegisteredApps/ApplicationsListBlade)
+  2. Click "New registration"
+  3. Name: `{Display Name}` (or `{Display Name} - Dev`)
+  4. Supported account types: "Accounts in this organizational directory only"
+  5. Redirect URI: Web > `https://{url}/getAToken`
+  6. After creation: Certificates & secrets > New client secret
+  7. Note the Client ID (from Overview) and Secret value
+- Record client IDs and secrets for use in Step 7
+- Update `project.yaml`
+
+### Step 5: Auth Access Model
+
+- Ask: "Who should have access to this application?"
+  - **Option A -- Specific users only (allowlist, recommended):** Only email addresses you explicitly list will have access. Everyone else in the org gets denied. This is the safer default -- access is granted intentionally, not automatically. Good for most apps, especially dev environments.
+  - **Option B -- All org users (opt-in):** Anyone with a `@rowancountync.gov` email in the Rowan County Azure AD tenant can log in. Only use this for tools intended for the entire organization.
+- Default to allowlist. Always ask for the initial list of email addresses (comma-separated). They can add more later via the `ALLOWED_USERS` environment variable.
+- If the user explicitly chooses all_org, confirm that they intend for every employee in the organization to have access.
+- Write the choice to `project.yaml` (`auth.mode: allowlist` or `auth.mode: all_org`)
+- If allowlist, write `auth.allowed_users` list to `project.yaml`
+
+### Step 6: Portainer Stacks
+
+- Check if `.operator.env` exists and has `PORTAINER_PROD_URL` and `PORTAINER_PROD_API_KEY`
+- **If Portainer API credentials are available:** offer to create stack(s) via API
+- **If no API credentials:** walk the user through it step by step:
+  1. "What is the URL for your Portainer instance?" (e.g., `https://portainer.rowancountync.gov`)
+  2. If they don't know how to get an API key, walk them through it:
+     - Log into Portainer
+     - Click your username (bottom-left) or go to **My Account**
+     - Scroll to **Access Tokens**
+     - Click **Add Access Token**
+     - Give it a description (e.g., `github-actions-prod`)
+     - Copy the token immediately (it won't be shown again)
+  3. Guide stack creation:
+     - Go to **Stacks** > **Add stack**
+     - Choose **Git repository**
+     - Repository URL: `https://github.com/{owner}/{repo}`
+     - Reference: `refs/heads/main` (prod) or `refs/heads/dev` (dev)
+     - Compose path: `docker-compose.yml`
+     - Enable **Authentication** and provide GitHub username + PAT
+     - Add environment variables: leave empty for now (CI/CD will inject them)
+     - Deploy the stack
+     - Note the **Stack ID** from the URL (e.g., `/stacks/42` means ID is `42`)
+     - Note the **Endpoint ID** from the URL (e.g., `endpointId=2` means ID is `2`)
+  4. If deployed dev: repeat for dev stack pointing at `dev` branch on the dev Portainer instance
+- Record: Portainer URL(s), API key(s), stack ID(s), endpoint ID(s)
+
+### Step 7: GitHub Configuration (Secrets AND Variables)
+
+**Key concept:** Only actual secrets (tokens, passwords, keys) go in GitHub Secrets. Configuration values (URLs, IDs, feature flags) go in GitHub Variables so they're readable and auditable.
+
+- **Tool check:** Run `gh --version` to check if GitHub CLI is installed
+  - If NOT installed: `winget install -e --id GitHub.cli` (Windows) or `brew install gh` (macOS) or https://cli.github.com/
+  - Then: `gh auth login`
+  - If they can't install, list everything they need to set manually in Settings > Environments
+- Check auth status: `gh auth status`
+- Create environments:
+  ```
+  gh api repos/{owner}/{repo}/environments/Production -X PUT
+  gh api repos/{owner}/{repo}/environments/Development -X PUT   # only if deployed dev
+  ```
+- Generate `FLASK_SECRET_KEY`: `python -c "import secrets; print(secrets.token_hex(32))"`
+
+**Set SECRETS** (write-only, for sensitive values):
+```
+gh secret set FLASK_SECRET_KEY --env Production --body "{generated_key}"
+gh secret set AZURE_CLIENT_SECRET --env Production --body "{client_secret}"
+gh secret set PORTAINER_API_KEY --env Production --body "{api_key}"
+gh secret set CLOUDFLARE_TUNNEL_TOKEN --env Production --body "{tunnel_token}"
+gh secret set GH_PAT --env Production --body "{github_pat}"
+```
+
+**Set VARIABLES** (readable, for configuration):
+```
+gh variable set PORTAINER_URL --env Production --body "{portainer_url}"
+gh variable set PORTAINER_STACK_ID --env Production --body "{stack_id}"
+gh variable set PORTAINER_ENDPOINT_ID --env Production --body "{endpoint_id}"
+gh variable set AUTH_ENABLED --env Production --body "true"
+gh variable set AUTH_MODE --env Production --body "{allowlist or all_org}"
+gh variable set ALLOWED_USERS --env Production --body "{comma-separated emails, if allowlist}"
+gh variable set AZURE_CLIENT_ID --env Production --body "{client_id}"
+gh variable set AZURE_TENANT_ID --env Production --body "{tenant_id}"
+gh variable set REDIRECT_URI --env Production --body "https://{prod-url}/getAToken"
+gh variable set POST_LOGOUT_REDIRECT_URI --env Production --body "https://{prod-url}"
+gh variable set ALLOWED_TENANT_ID --env Production --body "977b42ab-7737-4552-86e7-b09ed296213d"
+gh variable set ALLOWED_EMAIL_DOMAIN --env Production --body "@rowancountync.gov"
+```
+
+- Repeat for Development environment with dev-specific values if applicable
+- Update `project.yaml` setup_state
+
+### Step 8: Dev Branch
+
+- Create the `dev` branch: `git checkout -b dev && git push -u origin dev`
+
+### Step 9: First Deploy
+
+- Guide the user to push to dev (if configured) and verify:
+  - Check GitHub Actions for deploy success (should complete in under 30 seconds)
+  - Check the dev URL loads
+- Guide merge to main and verify production:
+  - `git checkout main && git merge dev && git push origin main`
+  - Check GitHub Actions for deploy success
+  - Check the production URL loads
+  - If auth is enabled, verify Microsoft login works
+- Troubleshooting checklist:
+  - GitHub Actions logs for deploy errors
+  - Portainer stack logs for container startup or build errors
+  - Cloudflare tunnel status (should be "Healthy") in Zero Trust dashboard
+  - Azure AD redirect URIs must match exactly
+
+### Step 10: Build Your App
+
+- **Template cleanup (do this first):**
+  Before building the app, clean up the template scaffolding:
+  1. Rewrite `README.md` with project-specific content: architecture, deployment instructions, environment variables, and local dev setup. Model it after IT-On-Call's README structure (project description, architecture diagram, environments table, deployment instructions, project structure, env var tables, local dev instructions).
+  2. Delete `SETUP.md` -- setup is complete and this file is no longer needed.
+  3. Delete or reset `CHANGELOG.md` -- the template's changelog is not relevant to the new project. Either delete it or clear it for the project's own changelog.
+  4. Update `templates/index.html` -- replace "Web Application" and "Template starter application" with the project's display name from `project.yaml`.
+  5. Commit these changes with the message "Initialize {display_name} from template".
+
+- **Then ask:** "What do you want this application to do?"
+- Based on the answer, help build the app's routes, templates, and logic
+- Remind the user where to add things:
+  - Routes: `app.py` below the `YOUR APPLICATION ROUTES BELOW` marker
+  - Dependencies: `requirements.txt`
+  - Templates: `templates/`
+  - Static assets: `static/`
+  - New env vars: see dev-guide.mdc for the three-place pattern (compose, workflow, .env.example)
+
+## Important Constraints
+
+- Never hardcode secrets in any file
+- Never commit `.env` or `.operator.env` files
+- Always use environment variables for configuration
+- Rowan County defaults (tenant ID, email domain) are configurable via env vars, not hardcoded in Python
+- The `az login` subscription should be "Rowan County Monthly"
+- Python scripts should operate within a venv when running locally
+- Only one RunPowerShellScript may be invoked at a time per Azure Compute VM
+- Only true secrets belong in GitHub Secrets; configuration belongs in GitHub Variables

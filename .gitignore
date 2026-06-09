@@ -1,0 +1,49 @@
+# Environment variables and secrets
+.env
+*.env
+.operator.env
+.operator.env.*
+
+# Allow example env files (templates, not real secrets)
+!.env.example
+!.operator.env.example
+
+# Local project overrides
+project.yaml.local
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+pip-log.txt
+pip-delete-this-directory.txt
+
+# Flask
+instance/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Local SQLite chat log (persisted in Docker via volume)
+data/*.db
+data/*.db-*
+
+# Logs and temp files
+logs/
+*.log
+*.zip
+
+# Docker
+.docker/

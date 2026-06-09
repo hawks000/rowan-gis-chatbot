@@ -1,0 +1,102 @@
+---
+description: Development guidance for configured Rowan County web apps
+globs:
+  - "**/*.py"
+  - "**/*.html"
+  - docker-compose.yml
+  - docker-compose.dev.yml
+  - requirements.txt
+  - Dockerfile
+  - .github/workflows/*.yml
+alwaysApply: true
+---
+
+# Rowan County Web App - Development Guide
+
+## When This Rule Activates
+
+This rule applies when the project is already configured (check `project.yaml` -- `project.name` is not empty).
+
+## Project Architecture
+
+- **Entry point**: `app.py` exposes a Flask `app` object. Gunicorn runs it via `app:app`.
+- **Authentication**: `auth.py` provides `AuthManager` (MSAL). The `create_auth_manager()` factory returns `None` when `AUTH_ENABLED=false`.
+- **Auth decorator**: `@require_auth` in `app.py` protects routes. It passes through when auth is disabled.
+- **Authorization**: `is_user_authorized()` checks access based on `AUTH_MODE`:
+  - `allowlist` (default): allows only specific emails listed in `ALLOWED_USERS` (comma-separated), still requires tenant match
+  - `all_org`: allows all users matching `ALLOWED_TENANT_ID` and `ALLOWED_EMAIL_DOMAIN`
+- **Health check**: `/health` returns `{"status": "healthy"}` and is used by Docker and monitoring.
+
+## CI/CD Flow
+
+Read `project.yaml` to understand the environment model:
+- `environments.development.deployed: true` means dev has its own stack and tunnel
+- Push to `dev` branch -> GitHub Actions -> trigger Portainer dev stack redeploy
+- Push/merge to `main` branch -> GitHub Actions -> trigger Portainer prod stack redeploy
+- If dev is not deployed, pushing to `dev` has no deployment effect
+- GitHub Actions does NOT build Docker images or push to any registry. Portainer builds locally.
+- Each deploy is tagged with a CalVer version (`APP_VERSION`), e.g., `2026.03.23.42`
+
+## Where to Add Things
+
+### New routes
+Add below the `YOUR APPLICATION ROUTES BELOW` marker in `app.py`. Use `@require_auth` for protected routes.
+
+### New dependencies
+Add to `requirements.txt`. The Dockerfile installs them during build.
+
+### New environment variables
+
+**Secrets** (tokens, passwords, keys -- values that must stay hidden):
+1. `docker-compose.yml` -- in the `webapp` service `environment` section
+2. `.github/workflows/build-deploy.yml` -- as `${{ secrets.YOUR_SECRET }}` in the `env` block and in the `jq` payload
+3. `.env.example` -- document it (with a placeholder, never the real value)
+4. GitHub: `gh secret set YOUR_SECRET --env Production --body "value"`
+
+**Variables** (URLs, IDs, feature flags -- non-sensitive configuration):
+1. `docker-compose.yml` -- in the `webapp` service `environment` section
+2. `.github/workflows/build-deploy.yml` -- as `${{ vars.YOUR_VAR }}` in the `env` block and in the `jq` payload
+3. `.env.example` -- document it
+4. GitHub: `gh variable set YOUR_VAR --env Production --body "value"`
+
+The difference: secrets are write-only (invisible after being set), variables are readable and auditable. Only use secrets for values that would be dangerous if exposed.
+
+### New templates
+Add HTML files to `templates/`. Reference them with `render_template('yourfile.html')`.
+
+### New static assets
+Place in `static/`. Reference in templates as `/static/filename.ext`.
+
+## Secret Handling Rules
+
+- **Never** hardcode secrets in Python files, templates, or README
+- True secrets (keys, tokens, passwords) go in **GitHub Environment Secrets** via `gh secret set`
+- Configuration values (URLs, IDs, flags, domains) go in **GitHub Environment Variables** via `gh variable set`
+- Operator credentials (Portainer API keys, Cloudflare API tokens) belong only in `.operator.env` locally
+- Use `os.getenv()` for all configuration in Python code
+
+## Auth Configuration
+
+| Variable | Purpose | Default |
+|----------|---------|---------|
+| `AUTH_ENABLED` | Enable/disable Azure AD auth | `true` |
+| `AUTH_MODE` | `allowlist` (named users only) or `all_org` (everyone in org) | `allowlist` |
+| `ALLOWED_USERS` | Comma-separated emails for allowlist mode | (empty) |
+| `ALLOWED_TENANT_ID` | Azure tenant ID to allow | Rowan County tenant |
+| `ALLOWED_EMAIL_DOMAIN` | Email domain to allow (all_org mode) | `@rowancountync.gov` |
+
+## Rowan County Standards
+
+- Python scripts SHALL operate within a venv when running local
+- Azure CLI commands SHALL be used when possible for working with Azure resources
+- Use `az login` to the subscription "Rowan County Monthly"
+- New Azure resource groups SHALL NOT be created unless defined and approved by the user
+- Only one RunPowerShellScript may be invoked at a time per Azure Compute VM
+
+## Docker and Deployment
+
+- The `Dockerfile` uses Python 3.11-slim with Gunicorn
+- The compose stack has two services: `webapp` (the app) and `cloudflare-tunnel` (the sidecar)
+- Portainer deploys by pulling the repo and building from source (git-based redeploy)
+- No container registry is used. No Docker images are built on GitHub.
+- Each deploy sets `APP_VERSION` to a CalVer tag (e.g., `2026.03.23.42`), which is used as the Docker image tag in `docker-compose.yml` to force a fresh build on every deploy

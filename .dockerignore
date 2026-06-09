@@ -1,0 +1,17 @@
+.env*
+.operator.env*
+venv/
+.venv/
+__pycache__/
+*.pyc
+.git/
+.github/
+*.md
+project.yaml
+project.yaml.local
+.cursor/
+.docker/
+.gitignore
+.dockerignore
+logs/
+*.log

@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Authentication Error</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Poppins', 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #2d8659 0%, #1e5f3f 100%);
+            min-height: 100vh;
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            padding: 20px;
+        }
+
+        .container {
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(45, 134, 89, 0.2);
+            padding: 40px;
+            max-width: 500px;
+            width: 100%;
+            border-top: 5px solid #dc3545;
+            text-align: center;
+        }
+
+        .error-icon {
+            font-size: 4rem;
+            color: #dc3545;
+            margin-bottom: 20px;
+        }
+
+        h1 {
+            color: #dc3545;
+            font-size: 2rem;
+            margin-bottom: 15px;
+            font-weight: 500;
+        }
+
+        .error-message {
+            color: #666;
+            font-size: 1.1rem;
+            margin-bottom: 30px;
+            line-height: 1.5;
+        }
+
+        .btn {
+            background: linear-gradient(135deg, #2d8659 0%, #1e5f3f 100%);
+            color: white;
+            border: none;
+            padding: 15px 30px;
+            border-radius: 8px;
+            font-size: 1.1rem;
+            cursor: pointer;
+            transition: all 0.3s ease;
+            text-decoration: none;
+            display: inline-block;
+            font-weight: 600;
+            text-transform: uppercase;
+            letter-spacing: 0.5px;
+        }
+
+        .btn:hover {
+            transform: translateY(-2px);
+            box-shadow: 0 10px 20px rgba(45, 134, 89, 0.3);
+        }
+
+        .footer {
+            margin-top: 30px;
+            padding-top: 20px;
+            border-top: 1px solid #dee2e6;
+            color: #6c757d;
+            font-size: 0.85rem;
+        }
+
+        .footer a {
+            color: #2d8659;
+            text-decoration: none;
+        }
+
+        .footer a:hover {
+            text-decoration: underline;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="error-icon">&#9888;&#65039;</div>
+        <h1>Authentication Error</h1>
+        <div class="error-message">
+            {{ error or "An authentication error occurred. Please try again." }}
+        </div>
+        <a href="{{ url_for('login') }}" class="btn">Try Again</a>
+
+        <div class="footer">
+            <p><a href="https://www.rowancountync.gov/" target="_blank">Rowan County, NC</a></p>
+        </div>
+    </div>
+</body>
+</html>

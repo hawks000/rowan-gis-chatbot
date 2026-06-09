@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Rowan County GIS Assistant</title>
+    <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+</head>
+<body>
+    <div class="app-shell">
+        <header class="app-header">
+            <div>
+                <p class="eyebrow">Rowan County, NC</p>
+                <h1>GIS Assistant</h1>
+                <p class="subtitle">Ask about parcels, addresses, and property owners.</p>
+            </div>
+            <a class="admin-link" href="{{ url_for('admin_queries') }}">Staff log</a>
+        </header>
+
+        <main class="layout">
+            <section class="chat-panel">
+                <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
+
+                <div class="suggestions">
+                    <p class="suggestions-label">Try asking:</p>
+                    <div id="suggestion-buttons" class="suggestion-buttons"></div>
+                </div>
+
+                <form id="chat-form" class="chat-form">
+                    <input
+                        id="chat-input"
+                        type="text"
+                        placeholder="e.g. PIN 1234567890 or 123 Main St Salisbury"
+                        autocomplete="off"
+                        required
+                    >
+                    <button type="submit" id="chat-submit">Ask</button>
+                </form>
+
+                <p class="privacy-note">
+                    Questions are logged anonymously to help improve this service. Result details are not stored.
+                </p>
+            </section>
+
+            <section class="map-panel">
+                <div id="map-status" class="map-status">Loading map...</div>
+                <div id="map-view"></div>
+                <div id="result-list" class="result-list hidden"></div>
+            </section>
+        </main>
+    </div>
+
+    <script>
+        window.GIS_CHATBOT_CONFIG = {
+            basemapUrl: {{ basemap_url | tojson }},
+            queryUrl: {{ url_for('api_query') | tojson }},
+            layersUrl: {{ url_for('api_layers') | tojson }}
+        };
+    </script>
+    <script src="https://js.arcgis.com/4.29/"></script>
+    <script src="{{ url_for('static', filename='js/map.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+</body>
+</html>

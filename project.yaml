@@ -1,0 +1,34 @@
+# Rowan County GIS Chatbot - Project Configuration
+
+_template_version: "2026.03.23"
+
+project:
+  name: "rowan-gis-chatbot"
+  display_name: "Rowan County GIS Assistant"
+  port: 5002
+
+environments:
+  production:
+    url: "https://gis-chatbot.rowancountync.io"
+    deployed: false
+  development:
+    url: "https://gis-chatbot-dev.rowancountync.io"
+    deployed: false
+
+auth:
+  enabled: false
+  shared: null
+  mode: "allowlist"
+  allowed_users: []
+  allowed_tenant_id: "977b42ab-7737-4552-86e7-b09ed296213d"
+  allowed_email_domain: "@rowancountync.gov"
+
+admin_auth:
+  enabled: true
+  note: "Public chat is open; /admin/queries requires Azure AD allowlist"
+
+setup_state:
+  azure_app_created: false
+  cloudflare_tunnels_created: false
+  portainer_stacks_created: false
+  github_secrets_populated: false

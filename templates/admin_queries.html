@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>GIS Chatbot Query Log</title>
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+</head>
+<body class="admin-body">
+    <div class="admin-container">
+        <header class="admin-header">
+            <div>
+                <p class="eyebrow">Rowan County GIS Chatbot</p>
+                <h1>Query Log</h1>
+                <p class="subtitle">Review public questions to refine patterns and plan new features.</p>
+            </div>
+            <div class="admin-actions">
+                {% if admin_user and admin_user.name %}
+                <span class="admin-user">{{ admin_user.name }}</span>
+                {% endif %}
+                <a href="{{ url_for('index') }}">Back to chat</a>
+                {% if admin_auth_enabled %}
+                <a href="{{ url_for('admin_logout') }}">Sign out</a>
+                {% endif %}
+            </div>
+        </header>
+
+        <section class="stats-grid">
+            <div class="stat-card">
+                <span class="stat-value">{{ stats.total }}</span>
+                <span class="stat-label">Total queries</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-value">{{ stats.success_count }}</span>
+                <span class="stat-label">Successful</span>
+            </div>
+            <div class="stat-card">
+                <span class="stat-value">{{ stats.unmatched_count }}</span>
+                <span class="stat-label">Unmatched / failed parse</span>
+            </div>
+        </section>
+
+        <section class="filters">
+            <a class="filter-btn {% if not unmatched_only and not status_filter %}active{% endif %}"
+               href="{{ url_for('admin_queries') }}">All</a>
+            <a class="filter-btn {% if unmatched_only %}active{% endif %}"
+               href="{{ url_for('admin_queries', unmatched=1) }}">Unmatched only</a>
+            <a class="filter-btn {% if status_filter == 'success' %}active{% endif %}"
+               href="{{ url_for('admin_queries', status='success') }}">Success</a>
+            <a class="filter-btn {% if status_filter == 'no_results' %}active{% endif %}"
+               href="{{ url_for('admin_queries', status='no_results') }}">No results</a>
+            <a class="export-btn"
+               href="{{ url_for('admin_queries_export', unmatched=1 if unmatched_only else 0) }}">
+                Export CSV
+            </a>
+        </section>
+
+        <div class="table-wrap">
+            <table class="log-table">
+                <thead>
+                    <tr>
+                        <th>When (UTC)</th>
+                        <th>Message</th>
+                        <th>Intent</th>
+                        <th>Status</th>
+                        <th>Results</th>
+                        <th>Flag</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for entry in entries %}
+                    <tr>
+                        <td>{{ entry.created_at }}</td>
+                        <td class="message-cell">{{ entry.user_message }}</td>
+                        <td>{{ entry.intent_type or '—' }}</td>
+                        <td><span class="status-pill status-{{ entry.status }}">{{ entry.status }}</span></td>
+                        <td>{{ entry.result_count }}</td>
+                        <td>
+                            <button
+                                type="button"
+                                class="flag-btn {% if entry.needs_feature %}flagged{% endif %}"
+                                data-id="{{ entry.id }}"
+                                data-flagged="{{ entry.needs_feature }}"
+                            >
+                                {% if entry.needs_feature %}Flagged{% else %}Flag{% endif %}
+                            </button>
+                        </td>
+                    </tr>
+                    {% else %}
+                    <tr>
+                        <td colspan="6" class="empty-row">No queries logged yet.</td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </div>
+
+    <script>
+        document.querySelectorAll('.flag-btn').forEach((button) => {
+            button.addEventListener('click', async () => {
+                const entryId = button.dataset.id;
+                const currentlyFlagged = button.dataset.flagged === '1';
+                const response = await fetch(`/admin/queries/${entryId}/flag`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ needs_feature: !currentlyFlagged }),
+                });
+                if (response.ok) {
+                    const next = !currentlyFlagged;
+                    button.dataset.flagged = next ? '1' : '0';
+                    button.textContent = next ? 'Flagged' : 'Flag';
+                    button.classList.toggle('flagged', next);
+                }
+            });
+        });
+    </script>
+</body>
+</html>

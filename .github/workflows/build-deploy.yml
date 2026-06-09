@@ -1,0 +1,159 @@
+# =============================================================================
+# Hybrid Deployment Workflow
+# =============================================================================
+# This workflow does NOT build Docker images or push to any container registry.
+# It triggers a Portainer git-based redeploy, passing environment variables
+# from GitHub secrets and variables. Portainer pulls the repo and builds
+# images locally using docker-compose build directives.
+#
+# Secrets model:
+#   - True secrets (keys, tokens) live in GitHub Environment Secrets
+#   - Configuration (URLs, IDs, flags) lives in GitHub Environment Variables
+#   - Each deploy pushes current values to Portainer via API
+#   - Portainer caches the values for runtime (viewable in Portainer UI)
+#   - Changing a value in GitHub requires a redeploy to propagate
+#
+# Branch mapping:
+#   - dev  -> Development environment -> dev Portainer stack
+#   - main -> Production environment  -> prod Portainer stack
+# =============================================================================
+
+name: Deploy
+
+on:
+  push:
+    branches: [main, dev]
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment: "${{ github.ref_name == 'main' && 'Production' || 'Development' }}"
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set deploy metadata
+        id: meta
+        run: |
+          CALVER="$(date -u +'%Y.%m.%d').${{ github.run_number }}"
+          echo "calver=${CALVER}" >> $GITHUB_OUTPUT
+
+          if [ "${{ github.ref_name }}" = "main" ]; then
+            echo "environment=production" >> $GITHUB_OUTPUT
+          else
+            echo "environment=development" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Deploy to Portainer
+        env:
+          # --- Configuration (GitHub Environment Variables) ---
+          PORTAINER_URL: "${{ vars.PORTAINER_URL }}"
+          PORTAINER_STACK_ID: "${{ vars.PORTAINER_STACK_ID }}"
+          PORTAINER_ENDPOINT_ID: "${{ vars.PORTAINER_ENDPOINT_ID }}"
+          ENV_AUTH_ENABLED: "${{ vars.AUTH_ENABLED }}"
+          ENV_AUTH_MODE: "${{ vars.AUTH_MODE }}"
+          ENV_ALLOWED_USERS: "${{ vars.ALLOWED_USERS }}"
+          ENV_AZURE_CLIENT_ID: "${{ vars.AZURE_CLIENT_ID }}"
+          ENV_AZURE_TENANT_ID: "${{ vars.AZURE_TENANT_ID }}"
+          ENV_REDIRECT_URI: "${{ vars.REDIRECT_URI }}"
+          ENV_POST_LOGOUT_REDIRECT_URI: "${{ vars.POST_LOGOUT_REDIRECT_URI }}"
+          ENV_ALLOWED_TENANT_ID: "${{ vars.ALLOWED_TENANT_ID }}"
+          ENV_ALLOWED_EMAIL_DOMAIN: "${{ vars.ALLOWED_EMAIL_DOMAIN }}"
+          # --- Secrets (GitHub Environment Secrets) ---
+          PORTAINER_API_KEY: "${{ secrets.PORTAINER_API_KEY }}"
+          ENV_FLASK_SECRET_KEY: "${{ secrets.FLASK_SECRET_KEY }}"
+          ENV_AZURE_CLIENT_SECRET: "${{ secrets.AZURE_CLIENT_SECRET }}"
+          ENV_CLOUDFLARE_TUNNEL_TOKEN: "${{ secrets.CLOUDFLARE_TUNNEL_TOKEN }}"
+          GH_PAT: "${{ secrets.GH_PAT }}"
+          ENV_ENVIRONMENT: "${{ steps.meta.outputs.environment }}"
+          # === APP-SPECIFIC (add your app's secrets/variables below) ===
+          # ENV_DATABASE_URL: "${{ secrets.DATABASE_URL }}"
+          # ENV_SOME_CONFIG: "${{ vars.SOME_CONFIG }}"
+        run: |
+          if [ -z "$PORTAINER_URL" ]; then
+            echo "Portainer deploy skipped - PORTAINER_URL not configured."
+            exit 0
+          fi
+
+          echo "Deploying to ${{ steps.meta.outputs.environment }}..."
+
+          ENDPOINT_ID="${PORTAINER_ENDPOINT_ID:-2}"
+
+          PAYLOAD=$(jq -n \
+            --arg environment "$ENV_ENVIRONMENT" \
+            --arg flask_key "$ENV_FLASK_SECRET_KEY" \
+            --arg flask_env "$ENV_ENVIRONMENT" \
+            --arg port "${ENV_PORT:-5001}" \
+            --arg auth_enabled "$ENV_AUTH_ENABLED" \
+            --arg auth_mode "$ENV_AUTH_MODE" \
+            --arg allowed_users "$ENV_ALLOWED_USERS" \
+            --arg azure_client_id "$ENV_AZURE_CLIENT_ID" \
+            --arg azure_client_secret "$ENV_AZURE_CLIENT_SECRET" \
+            --arg azure_tenant_id "$ENV_AZURE_TENANT_ID" \
+            --arg redirect_uri "$ENV_REDIRECT_URI" \
+            --arg post_logout "$ENV_POST_LOGOUT_REDIRECT_URI" \
+            --arg allowed_tenant "$ENV_ALLOWED_TENANT_ID" \
+            --arg allowed_domain "$ENV_ALLOWED_EMAIL_DOMAIN" \
+            --arg cf_token "$ENV_CLOUDFLARE_TUNNEL_TOKEN" \
+            --arg app_version "${{ steps.meta.outputs.calver }}" \
+            --arg gh_user "${{ github.actor }}" \
+            --arg gh_token "$GH_PAT" \
+            '{
+              env: [
+                {name: "ENVIRONMENT", value: $environment},
+                {name: "FLASK_SECRET_KEY", value: $flask_key},
+                {name: "FLASK_ENV", value: $flask_env},
+                {name: "FLASK_DEBUG", value: "false"},
+                {name: "PORT", value: $port},
+                {name: "AUTH_ENABLED", value: $auth_enabled},
+                {name: "AUTH_MODE", value: $auth_mode},
+                {name: "ALLOWED_USERS", value: $allowed_users},
+                {name: "AZURE_CLIENT_ID", value: $azure_client_id},
+                {name: "AZURE_CLIENT_SECRET", value: $azure_client_secret},
+                {name: "AZURE_TENANT_ID", value: $azure_tenant_id},
+                {name: "REDIRECT_URI", value: $redirect_uri},
+                {name: "POST_LOGOUT_REDIRECT_URI", value: $post_logout},
+                {name: "ALLOWED_TENANT_ID", value: $allowed_tenant},
+                {name: "ALLOWED_EMAIL_DOMAIN", value: $allowed_domain},
+                {name: "CLOUDFLARE_TUNNEL_TOKEN", value: $cf_token},
+                {name: "APP_VERSION", value: $app_version}
+              ],
+              prune: false,
+              pullImage: false,
+              repositoryReferenceName: "refs/heads/${{ github.ref_name }}",
+              repositoryAuthentication: true,
+              repositoryUsername: $gh_user,
+              repositoryPassword: $gh_token
+            }')
+
+          # === APP-SPECIFIC ENV VARS ===
+          # To add app-specific env vars to the Portainer payload, add entries
+          # to the jq args and the env array above. For example:
+          #   --arg database_url "$ENV_DATABASE_URL" \
+          # and in the env array:
+          #   {name: "DATABASE_URL", value: $database_url},
+
+          echo "Calling Portainer API..."
+          HTTP_CODE=$(curl -s -o /tmp/portainer_response.txt -w "%{http_code}" -X PUT \
+            "${PORTAINER_URL}/api/stacks/${PORTAINER_STACK_ID}/git/redeploy?endpointId=${ENDPOINT_ID}" \
+            -H "X-API-Key: ${PORTAINER_API_KEY}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          echo "HTTP response code: ${HTTP_CODE}"
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Deployment to Portainer complete!"
+          else
+            echo "Portainer API returned HTTP ${HTTP_CODE}"
+            cat /tmp/portainer_response.txt
+            exit 1
+          fi
+
+      - name: Summary
+        run: |
+          echo "### Deploy Complete" >> $GITHUB_STEP_SUMMARY
+          echo "- Version: \`${{ steps.meta.outputs.calver }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Environment: \`${{ steps.meta.outputs.environment }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- Branch: \`${{ github.ref_name }}\`" >> $GITHUB_STEP_SUMMARY

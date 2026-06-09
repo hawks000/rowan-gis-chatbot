@@ -1,0 +1,17 @@
+version: '3.8'
+
+# DEVELOPMENT OVERRIDE
+# Use with: docker compose -f docker-compose.yml -f docker-compose.dev.yml up
+# Adds hot-reload and development defaults.
+
+services:
+  webapp:
+    environment:
+      - ENVIRONMENT=development
+      - FLASK_ENV=development
+      - FLASK_DEBUG=true
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+    volumes:
+      - .:/app
+      - /app/venv
+    command: ["python", "app.py"]

@@ -1,0 +1,53 @@
+version: '3.8'
+
+# Rowan County Web App Template
+# All secrets are injected via environment variables.
+# Set them in Portainer stack environment, a .env file, or via CI/CD.
+
+services:
+  webapp:
+    image: webapp:${APP_VERSION:-dev}
+    build: .
+    ports:
+      - "${PORT:-5002}:${PORT:-5002}"
+    environment:
+      - ENVIRONMENT=${ENVIRONMENT:-production}
+      - FLASK_ENV=${FLASK_ENV:-production}
+      - FLASK_SECRET_KEY=${FLASK_SECRET_KEY}
+      - PORT=${PORT:-5002}
+      - FLASK_DEBUG=${FLASK_DEBUG:-false}
+      - AUTH_ENABLED=${AUTH_ENABLED:-false}
+      - ADMIN_AUTH_ENABLED=${ADMIN_AUTH_ENABLED:-true}
+      - AZURE_CLIENT_ID=${AZURE_CLIENT_ID}
+      - AZURE_CLIENT_SECRET=${AZURE_CLIENT_SECRET}
+      - AZURE_TENANT_ID=${AZURE_TENANT_ID}
+      - REDIRECT_URI=${REDIRECT_URI}
+      - POST_LOGOUT_REDIRECT_URI=${POST_LOGOUT_REDIRECT_URI}
+      - ALLOWED_TENANT_ID=${ALLOWED_TENANT_ID:-977b42ab-7737-4552-86e7-b09ed296213d}
+      - ALLOWED_EMAIL_DOMAIN=${ALLOWED_EMAIL_DOMAIN:-@rowancountync.gov}
+      - AUTH_MODE=${AUTH_MODE:-allowlist}
+      - ALLOWED_USERS=${ALLOWED_USERS:-}
+      - APP_VERSION=${APP_VERSION:-dev}
+      # === APP-SPECIFIC ENV VARS ===
+      - ARCGIS_BASE_URL=${ARCGIS_BASE_URL:-https://gis.rowancountync.gov/arcgis/rest/services}
+      - ARCGIS_BASEMAP_URL=${ARCGIS_BASEMAP_URL:-https://gis.rowancountync.gov/arcgis/rest/services/Public/Basemap/MapServer}
+      - PARCEL_LAYER_URL=${PARCEL_LAYER_URL:-Public/RowanTaxParcels/MapServer/0}
+      - CHAT_DB_PATH=${CHAT_DB_PATH:-/app/data/chatbot.db}
+      - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
+      - AZURE_OPENAI_KEY=${AZURE_OPENAI_KEY:-}
+    volumes:
+      - ./data:/app/data
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:${PORT:-5002}/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s
+
+  cloudflare-tunnel:
+    image: cloudflare/cloudflared:latest
+    command: tunnel --no-autoupdate run --token ${CLOUDFLARE_TUNNEL_TOKEN}
+    restart: unless-stopped
+    depends_on:
+      - webapp
