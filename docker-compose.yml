@@ -30,7 +30,7 @@ services:
       - APP_VERSION=${APP_VERSION:-dev}
       # === APP-SPECIFIC ENV VARS ===
       - ARCGIS_BASE_URL=${ARCGIS_BASE_URL:-https://gis.rowancountync.gov/arcgis/rest/services}
-      - ARCGIS_BASEMAP_URL=${ARCGIS_BASEMAP_URL:-https://gis.rowancountync.gov/arcgis/rest/services/Public/Basemap/MapServer}
+      - ARCGIS_BASEMAP_URL=${ARCGIS_BASEMAP_URL:-https://gis.rowancountync.gov/arcgis/rest/services/Public/MapViewer/MapServer}
       - PARCEL_LAYER_URL=${PARCEL_LAYER_URL:-Public/RowanTaxParcels/MapServer/0}
       - CHAT_DB_PATH=${CHAT_DB_PATH:-/app/data/chatbot.db}
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}

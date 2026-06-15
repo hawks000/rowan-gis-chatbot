@@ -22,7 +22,15 @@ DISPLAY_FIELDS = [
     "CALCACRE",
     "TOWNSHIP",
     "TAX_DISTRICT",
+    "DEEDBOOK",
+    "DEEDPAGE",
+    "PLATBOOK",
+    "PLATPAGE",
 ]
+
+ADDRESS_DISPLAY_FIELDS = ["Address", "ROAD_NAME", "ROAD_TYPE", "COMM", "FTRCODE"]
+STREET_DISPLAY_FIELDS = ["Whole_Name", "ROAD_NAME", "ROAD_TYPE", "CITYL", "CITYR"]
+SUBDIVISION_DISPLAY_FIELDS = ["SUBNAME", "SUBID", "PLATBOOK", "PLATPAGE"]
 
 LAYER_CATALOG = [
     {
@@ -34,15 +42,49 @@ LAYER_CATALOG = [
             "Who owns 550 MT HALL RD",
             "Find Earl Hawks owning property",
             "PIN 5733-04-51-7482",
-            "Show parcels on Woodleaf",
+            "How many parcels on Woodleaf",
         ],
     },
     {
-        "id": "search_parcels",
-        "name": "Property Search (Parcels)",
-        "layer_url": "Public/search/MapServer/2",
-        "fields": ["PIN", "OWNNAME", "PROP_ADDRESS"],
-        "examples": ["Used internally for address-centric searches"],
+        "id": "addressing",
+        "name": "Addressing Points",
+        "layer_url": "Public/search/MapServer/0",
+        "fields": ADDRESS_DISPLAY_FIELDS,
+        "examples": [
+            "Who owns 550 MT HALL RD",
+            "How many houses on Main Street",
+        ],
+    },
+    {
+        "id": "streets",
+        "name": "Street Centerlines",
+        "layer_url": "Public/search/MapServer/1",
+        "fields": STREET_DISPLAY_FIELDS,
+        "examples": [
+            "How many houses on Woodleaf Road",
+        ],
+    },
+    {
+        "id": "subdivisions",
+        "name": "Subdivisions",
+        "layer_url": "Public/search/MapServer/3",
+        "fields": SUBDIVISION_DISPLAY_FIELDS,
+        "examples": [
+            "How many addresses in subdivision Oak Hills",
+            "Who owns all parcels in subdivision Westbrook",
+        ],
+    },
+    {
+        "id": "parcel_report",
+        "name": "Parcel Report (zoning, flood, schools)",
+        "layer_url": "Public/ParcelReport/MapServer",
+        "fields": ["zoning", "flood", "schools", "soils", "voting", "parks"],
+        "examples": [
+            "What is the zoning for 550 MT HALL RD",
+            "What flood zone is PIN 5733-04-51-7482 in",
+            "Schools for 550 MT HALL RD",
+            "Property info for 550 MT HALL RD",
+        ],
     },
 ]
 
@@ -139,7 +181,14 @@ def summarize_features(geojson: dict[str, Any]) -> list[dict[str, Any]]:
     summaries = []
     for feature in geojson.get("features", []):
         props = feature.get("properties") or {}
-        summaries.append({field: props.get(field) for field in DISPLAY_FIELDS if field in props})
+        field_list = DISPLAY_FIELDS
+        if "Address" in props and "PIN" not in props:
+            field_list = ADDRESS_DISPLAY_FIELDS
+        elif "Whole_Name" in props and "PIN" not in props:
+            field_list = STREET_DISPLAY_FIELDS
+        elif "SUBNAME" in props and "PIN" not in props:
+            field_list = SUBDIVISION_DISPLAY_FIELDS
+        summaries.append({field: props.get(field) for field in field_list if field in props})
     return summaries
 
 

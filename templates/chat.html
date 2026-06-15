@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rowan County GIS Assistant</title>
     <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}?v=17">
 </head>
 <body>
     <div class="app-shell">
@@ -13,7 +13,7 @@
             <div>
                 <p class="eyebrow">Rowan County, NC</p>
                 <h1>GIS Assistant</h1>
-                <p class="subtitle">Ask about parcels, addresses, and property owners.</p>
+                <p class="subtitle">Ask about parcels, addresses, owners, streets, and subdivisions.</p>
             </div>
             <a class="admin-link" href="{{ url_for('admin_queries') }}">Staff log</a>
         </header>
@@ -54,12 +54,14 @@
     <script>
         window.GIS_CHATBOT_CONFIG = {
             basemapUrl: {{ basemap_url | tojson }},
+            webmapItemId: {{ webmap_item_id | tojson }},
+            portalUrl: {{ portal_url | tojson }},
             queryUrl: {{ url_for('api_query') | tojson }},
             layersUrl: {{ url_for('api_layers') | tojson }}
         };
     </script>
     <script src="https://js.arcgis.com/4.29/"></script>
-    <script src="{{ url_for('static', filename='js/map.js') }}"></script>
-    <script src="{{ url_for('static', filename='js/chat.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/map.js') }}?v=22"></script>
+    <script src="{{ url_for('static', filename='js/chat.js') }}?v=20"></script>
 </body>
 </html>

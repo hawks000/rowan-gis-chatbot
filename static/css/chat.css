@@ -115,11 +115,21 @@ body {
     border-bottom-right-radius: 4px;
 }
 
+.message.bot,
+.message.error {
+    white-space: pre-line;
+}
+
 .message.bot {
     align-self: flex-start;
     background: var(--green-100);
     color: var(--gray-900);
     border-bottom-left-radius: 4px;
+}
+
+.message.bot a {
+    color: var(--green-700);
+    font-weight: 600;
 }
 
 .message.error {

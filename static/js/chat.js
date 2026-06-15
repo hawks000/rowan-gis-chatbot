@@ -8,11 +8,70 @@ function getSessionId() {
     return sessionId;
 }
 
+function escapeHtml(text) {
+    return text
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+}
+
+function linkifyText(text) {
+    const lines = escapeHtml(text).split("\n");
+    return lines.map((line, index) => {
+        const urlMatch = line.match(/^(https?:\/\/[^\s<]+)$/);
+        if (!urlMatch) {
+            return line;
+        }
+        const previousLine = lines[index - 1] || "";
+        let label = "View on Register of Deeds";
+        if (previousLine.includes("Plat record:")) {
+            label = "View plat on Register of Deeds";
+        } else if (previousLine.includes("Deed record:")) {
+            label = "View deed on Register of Deeds";
+        }
+        return `<a href="${urlMatch[1]}" target="_blank" rel="noopener noreferrer">${label}</a>`;
+    }).join("\n");
+}
+
+function parcelFeatures(geojson) {
+    return (geojson?.features || []).filter((feature) => {
+        const props = feature.properties || {};
+        return props._lookup !== "address_point";
+    });
+}
+
+function findFeatureForSummary(geojson, summary, index) {
+    const features = parcelFeatures(geojson);
+    const pin = summary.PIN || summary.PARCEL_ID;
+    if (pin) {
+        const match = features.find((feature) => {
+            const props = feature.properties || {};
+            return props.PIN === pin || props.PARCEL_ID === pin;
+        });
+        if (match) {
+            return match;
+        }
+    }
+    return features[index] || null;
+}
+
+function setActiveResultItem(pin) {
+    document.querySelectorAll(".result-item").forEach((item) => {
+        const label = item.querySelector("strong");
+        item.classList.toggle("active", Boolean(pin && label && label.textContent === pin));
+    });
+}
+
 function appendMessage(text, role) {
     const container = document.getElementById("chat-messages");
     const bubble = document.createElement("div");
     bubble.className = `message ${role}`;
-    bubble.textContent = text;
+    if (role === "bot") {
+        bubble.innerHTML = linkifyText(text);
+    } else {
+        bubble.textContent = text;
+    }
     container.appendChild(bubble);
     container.scrollTop = container.scrollHeight;
 }
@@ -46,13 +105,18 @@ function renderResultList(summaries, geojson) {
         const button = document.createElement("button");
         button.type = "button";
         button.className = "result-item";
-        const pin = summary.PIN || summary.PARCEL_ID || "Unknown PIN";
-        const address = summary.PROP_ADDRESS || summary.TAXADD1 || "No address";
-        button.innerHTML = `<strong>${pin}</strong><span>${address}</span>`;
+        const pin = summary.PIN || summary.PARCEL_ID;
+        const address = summary.PROP_ADDRESS || summary.TAXADD1 || summary.Address || "No address";
+        const label = pin || summary.Whole_Name || summary.SUBNAME || "Result";
+        button.innerHTML = `<strong>${label}</strong><span>${address}</span>`;
         button.addEventListener("click", async () => {
-            document.querySelectorAll(".result-item").forEach((item) => item.classList.remove("active"));
-            button.classList.add("active");
-            const feature = geojson.features[index];
+            const pin = summary.PIN || summary.PARCEL_ID;
+            setActiveResultItem(pin);
+            const feature = findFeatureForSummary(geojson, summary, index);
+            if (!feature) {
+                console.warn("No map feature found for result", summary);
+                return;
+            }
             await window.GisMap.zoomToFeature(feature);
         });
         list.appendChild(button);
@@ -80,12 +144,20 @@ async function submitQuery(message) {
         const role = response.ok ? "bot" : "error";
         appendMessage(data.message || "Unexpected response.", role);
 
-        if (data.geojson) {
-            if (data.geocode) {
-                await window.GisMap.showGeocode(data.geocode);
+        if (data.geojson && window.GisMap) {
+            try {
+                await window.GisMap.whenReady();
+                await window.GisMap.showResults(
+                    data.geojson,
+                    data.overlay_geojson,
+                    data.geocode,
+                    data.map_target,
+                );
+                renderResultList(data.summaries || [], data.geojson);
+            } catch (mapError) {
+                console.error("Map update failed:", mapError);
+                appendMessage("Results loaded, but the map could not update.", "error");
             }
-            await window.GisMap.showResults(data.geojson, data.summaries || []);
-            renderResultList(data.summaries || [], data.geojson);
         }
     } catch (error) {
         appendMessage("Network error. Please try again.", "error");
@@ -111,10 +183,14 @@ async function loadLayerExamples() {
 
 document.addEventListener("DOMContentLoaded", () => {
     appendMessage(
-        "Hello! Ask about a parcel PIN, street address, owner name, or street.",
+        "Hello! Ask about a parcel PIN, address, owner, street, or subdivision.",
         "bot"
     );
     loadLayerExamples();
+
+    window.addEventListener("gis-parcel-selected", (event) => {
+        setActiveResultItem(event.detail?.pin || "");
+    });
 
     document.getElementById("chat-form").addEventListener("submit", async (event) => {
         event.preventDefault();

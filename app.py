@@ -8,6 +8,7 @@ import csv
 import io
 import logging
 import os
+import re
 import time
 from functools import wraps
 
@@ -32,11 +33,28 @@ from services.arcgis_client import (
     query_layer_at_point,
     summarize_features,
 )
+from services.address_geocode import geocode_rowan_address
+from services.rowan_address_search import search_rowan_address
 from services.chat_log import get_summary_stats, init_db, list_queries, log_query, set_needs_feature
-from services.nconemap_geocoder import GeocodeError, geocode_address
-from services.query_parser import build_where_clause, parse_query
+from services.nconemap_geocoder import GeocodeError
+from services.parcel_address_lookup import geocode_from_parcel_feature, lookup_parcel_by_address
+from services.parcel_report import format_property_details
+from services.rod_links import format_deed_record_line, format_plat_record_line
+from services.query_parser import QueryIntent, build_where_clause, parse_query, retry_intent_from_message
+from services.text_normalize import fuzzy_score, parse_address_parts, parse_city_from_query
+from services.search_layers import (
+    addresses_in_subdivision,
+    count_addresses_on_street,
+    enrich_parcel_report_flood,
+    enrich_parcel_report_city_limits,
+    identify_parcel_report_at_point,
+    parcels_in_subdivision,
+    query_parcel_report_by_polygon,
+    search_street_centerlines,
+    search_subdivision,
+)
 
-load_dotenv()
+load_dotenv(override=True)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
@@ -59,8 +77,13 @@ ALLOWED_USERS = [
 
 ARCGIS_BASEMAP_URL = os.getenv(
     "ARCGIS_BASEMAP_URL",
-    "https://gis.rowancountync.gov/arcgis/rest/services/Public/Basemap/MapServer",
+    "https://gis.rowancountync.gov/arcgis/rest/services/Public/MapViewer/MapServer",
 )
+ARCGIS_WEBMAP_ITEM_ID = os.getenv("ARCGIS_WEBMAP_ITEM_ID", "").strip()
+ARCGIS_PORTAL_URL = os.getenv(
+    "ARCGIS_PORTAL_URL",
+    "https://www.arcgis.com",
+).rstrip("/")
 
 logger.info(
     "GIS Chatbot starting - AUTH_ENABLED: %s, ADMIN_AUTH_ENABLED: %s",
@@ -116,11 +139,356 @@ def require_admin_auth(f):
     return decorated_function
 
 
-def _format_summary_message(intent, summaries, result_count, geocode=None):
+def _geocode_for_address_query(address: str) -> dict | None:
+    """Geocode an address, preferring Rowan points when the query names a city."""
+    geocode = None
+    try:
+        geocode = geocode_rowan_address(address)
+    except GeocodeError as exc:
+        logger.warning("Address geocode error: %s", exc)
+
+    city = parse_city_from_query(address)
+    if city:
+        try:
+            rowan = search_rowan_address(address)
+        except requests.RequestException as exc:
+            logger.warning("Rowan address search failed: %s", exc)
+            rowan = None
+        if rowan:
+            rowan_city = (rowan.get("attributes") or {}).get("COMM", "")
+            rowan_address = (rowan.get("address") or "").upper()
+            if city in rowan_address or rowan_city.startswith(city[:4]):
+                return rowan
+
+    return geocode
+
+
+def _geocode_source_label(geocode: dict | None) -> str:
+    if not geocode:
+        return ""
+    if geocode.get("source") == "tax_parcel":
+        return "Rowan County tax parcel records"
+    if geocode.get("source") == "rowan_addressing":
+        return "Rowan County addressing points"
+    if geocode.get("source") == "nconemap":
+        return "NC AddressNC geocoder (Rowan County)"
+    return "geocoder"
+
+
+def _location_line(row: dict) -> str:
+    address = row.get("PROP_ADDRESS") or row.get("TAXADD1") or "No address on file"
+    city = row.get("CITY") or ""
+    return f"{address}, {city}".strip(", ")
+
+
+def _resolve_geocode_for_parcel(
+    geojson: dict,
+    *,
+    address_query: str,
+) -> dict | None:
+    """Prefer geocoding that matches the tax parcel we already found."""
+    features = geojson.get("features") or []
+    if len(features) == 1:
+        parcel_geocode = geocode_from_parcel_feature(features[0])
+        if parcel_geocode:
+            return parcel_geocode
+
+    geocode = _geocode_for_address_query(address_query)
+    if len(features) == 1 and geocode:
+        row = (features[0].get("properties") or {})
+        parcel_label = _location_line(row).upper()
+        geocode_label = (geocode.get("address") or "").upper()
+        city = parse_city_from_query(address_query)
+        if city and city not in geocode_label and city in parcel_label:
+            parcel_geocode = geocode_from_parcel_feature(features[0])
+            if parcel_geocode:
+                return parcel_geocode
+
+    return geocode
+
+
+def _with_address_point(geojson: dict, geocode: dict | None) -> dict:
+    """Include the addressing point in GeoJSON so the map can zoom like parcel results."""
+    if not geocode or not geocode.get("location"):
+        return geojson
+
+    location = geocode["location"]
+    point_feature = {
+        "type": "Feature",
+        "geometry": {
+            "type": "Point",
+            "coordinates": [location["x"], location["y"]],
+        },
+        "properties": {
+            "Address": geocode.get("address") or "",
+            "_lookup": "address_point",
+        },
+    }
+    features = [point_feature, *(geojson.get("features") or [])]
+    return {**geojson, "features": features}
+
+
+def _walk_geojson_coordinates(coords, visit) -> None:
+    if not coords:
+        return
+    if isinstance(coords[0], (int, float)):
+        visit(coords[0], coords[1])
+        return
+    for part in coords:
+        _walk_geojson_coordinates(part, visit)
+
+
+def _scale_for_span(span: float) -> int:
+    if span > 0.05:
+        return 50000
+    if span > 0.01:
+        return 12000
+    if span > 0.003:
+        return 6000
+    if span > 0.001:
+        return 3000
+    return 1800
+
+
+def _build_map_target(geojson: dict, geocode: dict | None = None) -> dict | None:
+    """Compute a WGS84 center/extent the map can zoom to reliably."""
+    xmin = ymin = float("inf")
+    xmax = ymax = float("-inf")
+
+    def add_point(x: float, y: float) -> None:
+        nonlocal xmin, ymin, xmax, ymax
+        if not isinstance(x, (int, float)) or not isinstance(y, (int, float)):
+            return
+        xmin = min(xmin, x)
+        ymin = min(ymin, y)
+        xmax = max(xmax, x)
+        ymax = max(ymax, y)
+
+    for feature in geojson.get("features") or []:
+        props = feature.get("properties") or {}
+        if props.get("_lookup") == "address_point":
+            continue
+        geometry = feature.get("geometry") or {}
+        _walk_geojson_coordinates(geometry.get("coordinates"), add_point)
+
+    if geocode and geocode.get("location"):
+        location = geocode["location"]
+        add_point(location.get("x"), location.get("y"))
+
+    if not (xmin < float("inf")):
+        return None
+
+    span = max(xmax - xmin, ymax - ymin)
+    center = {"x": (xmin + xmax) / 2, "y": (ymin + ymax) / 2}
+    return {
+        "center": center,
+        "extent": {
+            "xmin": xmin,
+            "ymin": ymin,
+            "xmax": xmax,
+            "ymax": ymax,
+            "wkid": 4326,
+        },
+        "scale": _scale_for_span(span),
+    }
+
+
+def _fetch_parcel_report(geojson: dict, geocode: dict | None) -> dict | None:
+    """Query ParcelReport context using the parcel polygon when available."""
+    from services.search_layers import _parcel_polygon_features
+
+    parcel_features = _parcel_polygon_features(geojson)
+    report = None
+
+    if len(parcel_features) == 1:
+        geometry = parcel_features[0].get("geometry") or {}
+        if geometry.get("type") in {"Polygon", "MultiPolygon"}:
+            try:
+                polygon_report = query_parcel_report_by_polygon(geometry)
+                if polygon_report.get("results"):
+                    report = polygon_report
+            except requests.RequestException as exc:
+                logger.warning("ParcelReport polygon query failed: %s", exc)
+
+    if not report and geocode and geocode.get("location"):
+        location = geocode["location"]
+        try:
+            report = identify_parcel_report_at_point(location["x"], location["y"])
+        except requests.RequestException as exc:
+            logger.warning("ParcelReport identify failed: %s", exc)
+
+    if not report and len(parcel_features) == 1:
+        geometry = parcel_features[0].get("geometry") or {}
+        if geometry.get("type") == "Polygon" and geometry.get("coordinates"):
+            ring = geometry["coordinates"][0]
+            xs = [point[0] for point in ring]
+            ys = [point[1] for point in ring]
+            try:
+                report = identify_parcel_report_at_point((min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2)
+            except requests.RequestException as exc:
+                logger.warning("ParcelReport identify failed: %s", exc)
+
+    if not parcel_features:
+        return report
+
+    report = enrich_parcel_report_flood(report, geojson)
+    return enrich_parcel_report_city_limits(report, geojson)
+
+
+def _fuzzy_owner_search(name: str) -> dict:
+    """Broaden owner search when exact token matching finds nothing."""
+    import re
+
+    tokens = [
+        token for token in re.findall(r"[A-Za-z0-9]+", name.upper())
+        if len(token) >= 3 and token not in {"THE", "AND", "FOR", "OWN", "OWNING", "PROPERTY"}
+    ]
+    if not tokens:
+        return {"type": "FeatureCollection", "features": []}
+
+    longest = max(tokens, key=len).replace("'", "''")
+    broad = query_layer(
+        f"UPPER(OWNNAME) LIKE '%{longest}%'",
+        result_record_count=50,
+    )
+    matched = []
+    for feature in broad.get("features") or []:
+        owner = (feature.get("properties") or {}).get("OWNNAME") or ""
+        if fuzzy_score(name, owner) >= 0.62:
+            matched.append(feature)
+
+    return {"type": "FeatureCollection", "features": matched}
+
+
+def _narrow_parcel_results(
+    geojson: dict,
+    *,
+    query: str,
+    geocode: dict | None = None,
+) -> dict:
+    """When a geocoded point hits multiple parcels, keep the best address match."""
+    features = geojson.get("features") or []
+    if len(features) <= 1:
+        return geojson
+
+    compare_text = (geocode or {}).get("address") or query
+    house_number, street_tokens = parse_address_parts(query)
+    city = parse_city_from_query(query)
+    scored: list[tuple[float, dict]] = []
+
+    for feature in features:
+        props = feature.get("properties") or {}
+        candidate = props.get("PROP_ADDRESS") or props.get("TAXADD1") or ""
+        score = fuzzy_score(compare_text, candidate)
+        candidate_upper = candidate.upper()
+
+        parcel_house_match = re.match(r"^(\d+)", candidate.strip())
+        parcel_house = parcel_house_match.group(1) if parcel_house_match else None
+        if house_number and parcel_house:
+            if parcel_house == house_number:
+                score += 0.45
+            else:
+                score -= 0.55
+
+        if house_number and house_number in candidate_upper.split():
+            score += 0.2
+        if street_tokens and all(token in candidate_upper for token in street_tokens[:2]):
+            score += 0.15
+        if city:
+            parcel_city = (props.get("CITY") or "").upper()
+            if city in parcel_city or parcel_city.startswith(city[:4]):
+                score += 0.25
+            elif parcel_city:
+                score -= 0.2
+
+        scored.append((score, feature))
+
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if scored and scored[0][0] >= 0.55:
+        return {"type": "FeatureCollection", "features": [scored[0][1]]}
+    return geojson
+
+
+def _format_summary_message(intent, summaries, result_count, geocode=None, parcel_report=None):
+    source_label = _geocode_source_label(geocode)
+
+    def _value_line(row: dict) -> str:
+        value = row.get("TOT_VAL")
+        if isinstance(value, (int, float)):
+            return f"Total value: ${value:,.0f}"
+        return ""
+
+    def _deed_line(row: dict) -> str:
+        return format_deed_record_line(row.get("DEEDBOOK"), row.get("DEEDPAGE"))
+
+    def _plat_line(row: dict) -> str:
+        return format_plat_record_line(row.get("PLATBOOK"), row.get("PLATPAGE"))
+
+    def _record_lines(row: dict) -> list[str]:
+        return [_deed_line(row), _plat_line(row)]
+
+    def _detail_block(*, focus: str = "", parcel_pin: str | None = None) -> list[str]:
+        lines = format_property_details(parcel_report, focus=focus, parcel_pin=parcel_pin)
+        if not lines:
+            return []
+        heading = "Answer" if focus else "Property details"
+        block = [heading + ":"]
+        block.extend(f"• {line}" for line in lines)
+        return block
+
+    def _join(blocks: list[str]) -> str:
+        return "\n".join(block for block in blocks if block)
+
+    if intent.intent_type == "street_houses":
+        street = intent.value
+        if result_count == 0:
+            return f"No addresses found on {street}."
+        label = "address" if result_count == 1 else "addresses"
+        return (
+            f"Found {result_count} {label} on {street} "
+            f"(Rowan addressing points matched via street centerline Whole_Name)."
+        )
+
+    if intent.intent_type == "street_parcels":
+        street = intent.value
+        if result_count == 0:
+            return f"No parcels found on {street}."
+        if result_count == 1:
+            row = summaries[0]
+            pin = row.get("PIN") or row.get("PARCEL_ID") or "Unknown"
+            owner = row.get("OWNNAME") or "Unknown owner"
+            return f"Found 1 parcel on {street}: {pin} — {owner}."
+        return f"Found {result_count} parcels on {street}."
+
+    if intent.intent_type == "subdivision_addresses":
+        sub = intent.value
+        if result_count == 0:
+            return f"No addresses found in subdivision {sub}."
+        label = "address" if result_count == 1 else "addresses"
+        return f"Found {result_count} {label} in subdivision {sub}."
+
+    if intent.intent_type == "subdivision_parcels":
+        sub = intent.value
+        if result_count == 0:
+            return f"No parcels found in subdivision {sub}."
+        if result_count == 1:
+            row = summaries[0]
+            pin = row.get("PIN") or row.get("PARCEL_ID") or "Unknown"
+            owner = row.get("OWNNAME") or "Unknown owner"
+            return f"Found 1 parcel in {sub}: {pin} — {owner}."
+        owners = sorted({row.get("OWNNAME") for row in summaries if row.get("OWNNAME")})
+        owner_preview = ", ".join(owners[:5])
+        if len(owners) > 5:
+            owner_preview += f", and {len(owners) - 5} more"
+        return (
+            f"Found {result_count} parcels in subdivision {sub}. "
+            f"Owners include: {owner_preview}."
+        )
+
     if result_count == 0:
         if geocode and geocode.get("address"):
             return (
-                f"NC OneMap geocoded '{intent.value}' to {geocode['address']}, "
+                f"{source_label} matched '{intent.value}' to {geocode['address']}, "
                 "but no matching parcel polygon was found nearby."
             )
         return f"No parcels found for: {intent.description}."
@@ -129,44 +497,129 @@ def _format_summary_message(intent, summaries, result_count, geocode=None):
         row = summaries[0]
         pin = row.get("PIN") or row.get("PARCEL_ID") or "Unknown"
         owner = row.get("OWNNAME") or "Unknown owner"
-        address = row.get("PROP_ADDRESS") or row.get("TAXADD1") or "No address on file"
-        city = row.get("CITY") or ""
-        value = row.get("TOT_VAL")
-        value_text = f" Total value: ${value:,.0f}." if isinstance(value, (int, float)) else ""
-        location = f"{address}, {city}".strip(", ")
-        geocode_note = ""
-        if geocode and geocode.get("address"):
-            geocode_note = f" Located via NC OneMap at {geocode['address']}."
-        return f"Found parcel {pin} — {owner}. {location}.{value_text}{geocode_note}"
+        location = _location_line(row)
+        value_text = _value_line(row)
+        subject = location
+
+        blocks = []
+        if intent.context_focus:
+            blocks.append(f"For {subject}:")
+            blocks.extend(_detail_block(focus=intent.context_focus, parcel_pin=pin if pin != "Unknown" else None))
+            blocks.append("")
+            blocks.append(f"Parcel {pin}")
+        else:
+            blocks.append(f"Found parcel {pin}")
+
+        blocks.append(f"Owner: {owner}")
+        blocks.append(f"Address: {location}")
+        if value_text:
+            blocks.append(value_text)
+        blocks.extend(_record_lines(row))
+
+        if not intent.context_focus:
+            detail_lines = _detail_block(parcel_pin=pin if pin != "Unknown" else None)
+            if detail_lines:
+                blocks.append("")
+                blocks.extend(detail_lines)
+
+        blocks.append("")
+        blocks.append(f"Located via {source_label} at {location}.")
+
+        return _join(blocks)
 
     geocode_note = ""
     if geocode and geocode.get("address"):
-        geocode_note = f" Geocoded via NC OneMap: {geocode['address']}."
+        geocode_note = f" Matched via {source_label}: {geocode['address']}."
     return f"Found {result_count} parcels matching: {intent.description}.{geocode_note}"
 
 
-def _query_parcels_for_intent(intent):
-    """Run parcel query; geocode address intents via NC OneMap first."""
+def _layer_used_for_intent(intent: QueryIntent) -> str:
+    mapping = {
+        "address": "Public/search/MapServer/0",
+        "street_houses": "Public/search/MapServer/1 + 0",
+        "street_parcels": "Public/RowanTaxParcels/MapServer/0",
+        "subdivision_addresses": "Public/search/MapServer/3 + 0",
+        "subdivision_parcels": "Public/search/MapServer/3 + RowanTaxParcels",
+    }
+    return mapping.get(intent.intent_type, "RowanTaxParcels")
+
+
+def _query_for_intent(intent: QueryIntent):
+    """Route parsed intent to the correct GIS layer(s)."""
     geocode = None
+    parcel_report = None
+    overlay_geojson = None
+
+    if intent.intent_type == "street_houses":
+        geojson = count_addresses_on_street(intent.value)
+        streets = search_street_centerlines(intent.value, limit=5)
+        if streets.get("features"):
+            overlay_geojson = streets
+        return geojson, geocode, parcel_report, overlay_geojson
+
+    if intent.intent_type == "subdivision_addresses":
+        subdivisions = search_subdivision(intent.value)
+        geojson = addresses_in_subdivision(intent.value)
+        return geojson, geocode, parcel_report, subdivisions
+
+    if intent.intent_type == "subdivision_parcels":
+        subdivisions = search_subdivision(intent.value)
+        geojson = parcels_in_subdivision(intent.value)
+        return geojson, geocode, parcel_report, subdivisions
 
     if intent.intent_type == "address":
         try:
-            geocode = geocode_address(intent.value)
+            direct = lookup_parcel_by_address(intent.value)
+        except requests.RequestException as exc:
+            logger.warning("Direct parcel address lookup failed: %s", exc)
+            direct = None
+
+        if direct and direct.get("features"):
+            geojson = direct
+            geocode = _resolve_geocode_for_parcel(geojson, address_query=intent.value)
+            try:
+                parcel_report = _fetch_parcel_report(geojson, geocode)
+            except requests.RequestException as exc:
+                logger.warning("ParcelReport identify failed: %s", exc)
+            return geojson, geocode, parcel_report, overlay_geojson
+
+        try:
+            geocode = _geocode_for_address_query(intent.value)
         except GeocodeError as exc:
-            logger.warning("Geocoder error, falling back to attribute search: %s", exc)
+            logger.warning("Address geocode error: %s", exc)
+            geocode = None
 
         if geocode and geocode.get("location"):
             location = geocode["location"]
             geojson = query_layer_at_point(location["x"], location["y"])
+            geojson = _narrow_parcel_results(geojson, query=intent.value, geocode=geocode)
             if geojson.get("features"):
-                return geojson, geocode
+                geocode = _resolve_geocode_for_parcel(geojson, address_query=intent.value)
+                try:
+                    parcel_report = _fetch_parcel_report(geojson, geocode)
+                except requests.RequestException as exc:
+                    logger.warning("ParcelReport identify failed: %s", exc)
+                return geojson, geocode, parcel_report, overlay_geojson
 
         where = build_where_clause(intent)
         geojson = query_layer(where)
-        return geojson, geocode
+        return geojson, geocode, parcel_report, overlay_geojson
 
     where = build_where_clause(intent)
     geojson = query_layer(where)
+    if intent.intent_type == "owner" and not geojson.get("features"):
+        geojson = _fuzzy_owner_search(intent.value)
+    if geojson.get("features") and len(geojson.get("features", [])) == 1:
+        try:
+            parcel_report = _fetch_parcel_report(geojson, geocode)
+        except requests.RequestException as exc:
+            logger.warning("ParcelReport identify failed: %s", exc)
+    return geojson, geocode, parcel_report, overlay_geojson
+
+
+def _query_parcels_for_intent(intent):
+    """Backward-compatible wrapper."""
+    geojson, geocode, _, _ = _query_for_intent(intent)
     return geojson, geocode
 
 
@@ -278,6 +731,8 @@ def index():
     return render_template(
         "chat.html",
         basemap_url=ARCGIS_BASEMAP_URL,
+        webmap_item_id=ARCGIS_WEBMAP_ITEM_ID,
+        portal_url=ARCGIS_PORTAL_URL,
     )
 
 
@@ -331,9 +786,26 @@ def api_query():
         ), 422
 
     try:
-        geojson, geocode = _query_parcels_for_intent(intent)
+        geojson, geocode, parcel_report, overlay_geojson = _query_for_intent(intent)
         summaries = summarize_features(geojson)
         result_count = len(geojson.get("features", []))
+
+        if result_count == 0:
+            retry_intent = retry_intent_from_message(message, intent)
+            if retry_intent:
+                logger.info(
+                    "Retrying query with extracted subject %r (was %r)",
+                    retry_intent.value,
+                    intent.value,
+                )
+                intent = retry_intent
+                geojson, geocode, parcel_report, overlay_geojson = _query_for_intent(intent)
+                summaries = summarize_features(geojson)
+                result_count = len(geojson.get("features", []))
+
+        map_geojson = geojson
+        if geocode:
+            map_geojson = _with_address_point(geojson, geocode)
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 
         status = "success" if result_count else "no_results"
@@ -345,20 +817,26 @@ def api_query():
             intent=intent.to_dict(),
             status=status,
             result_count=result_count,
-            layer_used="RowanTaxParcels",
+            layer_used=_layer_used_for_intent(intent),
             response_ms=elapsed_ms,
         )
 
-        summary_message = _format_summary_message(intent, summaries, result_count, geocode)
+        summary_message = _format_summary_message(
+            intent, summaries, result_count, geocode, parcel_report
+        )
+        map_target = _build_map_target(map_geojson, geocode) if result_count else None
         return jsonify(
             {
                 "status": status,
                 "message": summary_message,
                 "intent": intent.to_dict(),
-                "geojson": geojson,
+                "geojson": map_geojson,
+                "overlay_geojson": overlay_geojson,
                 "summaries": summaries,
                 "result_count": result_count,
                 "geocode": geocode,
+                "parcel_report": parcel_report,
+                "map_target": map_target,
             }
         )
 
@@ -471,4 +949,4 @@ def admin_flag_query(entry_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     debug_mode = os.getenv("ENVIRONMENT", "production") == "development"
-    app.run(debug=debug_mode, host="0.0.0.0", port=port)
+    app.run(debug=debug_mode, host="0.0.0.0", port=port, use_reloader=debug_mode)
