@@ -90,6 +90,19 @@ def run_tests():
     assert intent.value == "304 157"
     assert intent.context_focus == "flood"
 
+    subdivision_phrases = [
+        ("how many parcels are in ARMISTEAD subd", "ARMISTEAD"),
+        ("how many parcels in ARMISTEAD sub", "ARMISTEAD"),
+        ("parcels in ARMISTEAD subd", "ARMISTEAD"),
+        ("how many parcels in subdivision ARMISTEAD", "ARMISTEAD"),
+        ("how many parcesl are in armistead sub", "ARMISTEAD"),
+    ]
+    for phrase, expected in subdivision_phrases:
+        intent = parse_query(phrase)
+        assert intent is not None, phrase
+        assert intent.intent_type == "subdivision_parcels", f"{phrase!r} -> {intent.intent_type}"
+        assert expected in intent.value.upper(), f"{phrase!r} -> {intent.value!r}"
+
     print("OK (parser normalization)")
 
 

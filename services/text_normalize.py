@@ -15,6 +15,9 @@ COMMON_TYPOS: dict[str, str] = {
     "propert": "property",
     "parcle": "parcel",
     "parcell": "parcel",
+    "parcesl": "parcels",
+    "parceles": "parcels",
+    "parcelss": "parcels",
     "zonning": "zoning",
     "zonig": "zoning",
     "zoing": "zoning",
@@ -31,6 +34,8 @@ COMMON_TYPOS: dict[str, str] = {
     "subdivison": "subdivision",
     "subdivisionn": "subdivision",
     "subdivsion": "subdivision",
+    "subdiv": "subdivision",
+    "subd": "subdivision",
     "sailsbury": "salisbury",
     "salsibury": "salisbury",
     "clevland": "cleveland",
@@ -78,6 +83,21 @@ ROWAN_PLACE_NAMES: dict[str, str] = {
 PIN_FULL_PATTERN = re.compile(r"\b(\d{4}-\d{2}-\d{2}-\d{4})\b", re.IGNORECASE)
 PIN_LABEL_PATTERN = re.compile(
     r"\b(?:pin|parcel(?:\s+(?:id|#|number))?|tax\s+id)\s*[:#]?\s*([A-Za-z0-9\-]+)\b",
+    re.IGNORECASE,
+)
+
+COUNT_QUERY_PATTERN = re.compile(
+    r"\bhow many\b|\bhow much\b|\bnumber of\b|\bcount\b",
+    re.IGNORECASE,
+)
+
+PARCEL_WORD_PATTERN = re.compile(
+    r"\b(?:parcels?|parcle|parcell|parcesl|parceles|properties)\b",
+    re.IGNORECASE,
+)
+
+SUBDIVISION_HINT_PATTERN = re.compile(
+    r"\bsub(?:division|d)?\b|\bsubdivision\b",
     re.IGNORECASE,
 )
 
@@ -161,6 +181,15 @@ CONTEXT_KEYWORDS = {
     "zoning", "zone", "district", "flood", "fema", "school", "schools", "soil", "soils",
     "voting", "precinct", "watershed", "property", "park", "parks",
 }
+
+
+def looks_like_count_query(text: str) -> bool:
+    normalized = normalize_query_text(text)
+    return bool(COUNT_QUERY_PATTERN.search(normalized))
+
+
+def looks_like_parcel_word(text: str) -> bool:
+    return bool(PARCEL_WORD_PATTERN.search(normalize_query_text(text)))
 
 
 def normalize_query_text(text: str) -> str:
@@ -278,6 +307,11 @@ def extract_search_subject(text: str) -> tuple[str, str]:
         if street:
             return street, "street"
 
+        if looks_like_count_query(stripped) or (
+            looks_like_parcel_word(stripped) and SUBDIVISION_HINT_PATTERN.search(stripped)
+        ):
+            return normalized, "raw"
+
         if len(stripped) >= 3:
             return stripped, "name"
 
@@ -326,6 +360,31 @@ def with_city_from_message(address: str, message: str) -> str:
     if city in upper or upper.endswith(city[:4]):
         return address
     return f"{address} {city}"
+
+
+def normalize_subdivision_query(name: str) -> str:
+    """Strip subdivision noise words and sub/subd suffixes from a search phrase."""
+    cleaned = normalize_query_text(name.strip().strip("?.!,"))
+    cleaned = re.sub(r"^(?:sub(?:division|d)?)\s+", "", cleaned, flags=re.I)
+    cleaned = re.sub(
+        r"\s+(?:sub(?:division|d)?|development|dev|phase|section|sec)\.?\s*$",
+        "",
+        cleaned,
+        flags=re.I,
+    )
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def subdivision_search_tokens(name: str) -> list[str]:
+    """Significant tokens for subdivision name matching."""
+    normalized = normalize_subdivision_query(name)
+    stopwords = {
+        "THE", "A", "AN", "OF", "FOR", "AND", "OR", "IN", "AT", "ON",
+        "SUBDIVISION", "SUB", "SUBD", "SUBDIV", "DEVELOPMENT", "DEV",
+        "PHASE", "SECTION", "SEC", "NC", "ROWAN", "COUNTY",
+    }
+    tokens = re.findall(r"[A-Za-z0-9]+", normalized.upper())
+    return [token for token in tokens if len(token) >= 3 and token not in stopwords]
 
 
 def fuzzy_best_match(query: str, candidates: list[str], *, min_ratio: float = 0.72) -> str | None:

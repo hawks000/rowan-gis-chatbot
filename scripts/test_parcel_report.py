@@ -96,6 +96,22 @@ def run_tests():
     empty = summarize_parcel_report({"results": []}, focus="zoning")
     assert "No zoning polygon" in empty["lines"][0]
 
+    fire = summarize_parcel_report({
+        "results": [{
+            "layerName": "Fire District",
+            "attributes": {"MAIN_DISTRICT": "CLEVELAND", "CAD": "4504"},
+        }]
+    }, focus="property_info")
+    assert any("Fire district: Cleveland" in line for line in fire["lines"])
+
+    airport = summarize_parcel_report({
+        "results": [{
+            "layerName": "Airport Overlay",
+            "attributes": {"in_overlay": True},
+        }]
+    }, focus="property_info")
+    assert any("Airport overlay: Yes" in line for line in airport["lines"])
+
     print("OK (parcel report formatter)")
 
 

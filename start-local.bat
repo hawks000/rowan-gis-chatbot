@@ -25,15 +25,15 @@ if not exist "%VENV%\Scripts\python.exe" (
 
 cd /d "%~dp0"
 
-netstat -ano | findstr ":%PORT% " | findstr "LISTENING" >nul 2>&1
-if %errorlevel%==0 (
-  echo.
-  echo  Stopping existing process on port %PORT% ...
-  for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%PORT% " ^| findstr "LISTENING"') do (
-    taskkill /PID %%a /F >nul 2>&1
-  )
-  timeout /t 2 /nobreak >nul
+echo.
+echo  Stopping any existing GIS Chatbot Python processes ...
+for /f "skip=1 tokens=1" %%a in ('wmic process where "CommandLine like '%%rowan-gis-chatbot%%app.py%%'" get ProcessId 2^>nul') do (
+  if not "%%a"=="" taskkill /PID %%a /F >nul 2>&1
 )
+for /f "tokens=5" %%a in ('netstat -ano ^| findstr ":%PORT% " ^| findstr "LISTENING"') do (
+  taskkill /PID %%a /F >nul 2>&1
+)
+timeout /t 2 /nobreak >nul
 
 echo.
 echo  Starting GIS Chatbot at http://localhost:%PORT%

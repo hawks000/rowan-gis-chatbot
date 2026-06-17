@@ -4,12 +4,16 @@ import re
 from dataclasses import asdict, dataclass
 from typing import Any
 
+from services.owner_search import build_owner_where_clause
 from services.text_normalize import (
     detect_context_focus,
     extract_address_fragment,
     extract_pin_from_text,
     extract_search_subject,
+    looks_like_count_query,
+    looks_like_parcel_word,
     normalize_query_text,
+    normalize_subdivision_query,
     strip_question_wrapper,
     with_city_from_message,
 )
@@ -45,6 +49,10 @@ ROWAN_TAX_PARCEL_ID_PATTERN = re.compile(
 )
 
 WHO_OWNS_PATTERN = re.compile(r"who owns\s+(.+)", re.IGNORECASE)
+DOES_OWN_PATTERN = re.compile(
+    r"^does\s+(.+?)\s+(?:own|on)\s+(?:any\s+)?(?:property|properties|land|parcels?|real\s+estate|anything)\s*\??$",
+    re.IGNORECASE,
+)
 FIND_OWNING_PATTERN = re.compile(
     r"(?:find|search for|look up|lookup)\s+(.+?)\s+owning(?:\s+property|\s+properties)?\s*$",
     re.IGNORECASE,
@@ -68,6 +76,10 @@ STREET_PARCEL_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
+SUBDIVISION_PARCEL_COUNT_PATTERN = re.compile(
+    r"how many parcels?(?: are)?(?: in| inside| within)\s+(.+?)\??$",
+    re.IGNORECASE,
+)
 SUBDIVISION_ADDRESS_COUNT_PATTERN = re.compile(
     r"how many (?:addresses|houses|homes|address points?)(?: are)? in (?:subdivision|sub(?:division)?)\s+(.+?)\??$",
     re.IGNORECASE,
@@ -75,6 +87,37 @@ SUBDIVISION_ADDRESS_COUNT_PATTERN = re.compile(
 SUBDIVISION_PARCEL_PATTERN = re.compile(
     r"(?:(?:who owns|find|show)(?:\s+all)?\s+(?:the\s+)?parcels?(?:\s+owned)?|parcels?(?:\s+owned)?|properties)"
     r"(?:\s+in|\s+inside|\s+within)\s+(?:subdivision|sub(?:division)?)\s+(.+?)\??$",
+    re.IGNORECASE,
+)
+SUBDIVISION_BOTH_PATTERN = re.compile(
+    r"(?:parcels?\s+and\s+(?:/|or\s+)?addresses?|addresses?\s+and\s+(?:/|or\s+)?parcels?)"
+    r"(?:\s+in|\s+inside|\s+within)\s+(.+?)\??$",
+    re.IGNORECASE,
+)
+SUBDIVISION_PARCELS_IN_PATTERN = re.compile(
+    r"(?:show|find|list|get|search for|who owns)?\s*(?:all\s+)?(?:the\s+)?parcels?(?:\s+owned)?"
+    r"(?:\s+in|\s+inside|\s+within)\s+(.+?)\??$",
+    re.IGNORECASE,
+)
+SUBDIVISION_ADDRESSES_IN_PATTERN = re.compile(
+    r"(?:show|find|list|get|search for)?\s*(?:all\s+)?(?:the\s+)?(?:addresses|houses|homes|address points?)"
+    r"(?:\s+in|\s+inside|\s+within)\s+(.+?)\??$",
+    re.IGNORECASE,
+)
+SUBDIVISION_NAME_PATTERN = re.compile(
+    r"^(?:subdivision|sub(?:division)?)\s+(.+?)\??$",
+    re.IGNORECASE,
+)
+LIST_SUBDIVISIONS_PATTERN = re.compile(
+    r"(?:list|show|name|what are|give me|can you list).*(?:all\s+)?(?:the\s+)?(?:approved\s+)?subdivision(?:\s+name)?s?",
+    re.IGNORECASE,
+)
+COUNT_SUBDIVISIONS_PATTERN = re.compile(
+    r"how many\s+(?:approved\s+)?(?:major\s+)?subdivision(?:\s+name)?s?",
+    re.IGNORECASE,
+)
+COUNT_SUBDIVISIONS_IN_ROWAN_PATTERN = re.compile(
+    r"how many\s+subdivision(?:\s+name)?s?(?:\s+are)?(?:\s+in)?(?:\s+rowan)?(?:\s+county)?",
     re.IGNORECASE,
 )
 
@@ -100,7 +143,7 @@ STOPWORDS = {
     "THE", "A", "AN", "OF", "FOR", "AND", "OR", "TO", "IN", "AT", "ON", "ALONG",
     "PROPERTY", "PROPERTIES", "PARCEL", "PARCELS", "NC", "NORTH",
     "CAROLINA", "ROWAN", "COUNTY", "YOU", "ME", "MY", "ANY", "ALL",
-    "PIN", "ID", "NUMBER", "NUM", "TAX", "SUBDIVISION", "SUB",
+    "PIN", "ID", "NUMBER", "NUM", "TAX", "SUBDIVISION", "SUB", "SUBD", "SUBDIV",
 }
 
 STREET_TOKENS = (
@@ -115,11 +158,23 @@ def _clean_value(value: str) -> str:
     return re.sub(r"\s+", " ", cleaned)
 
 
+def _clean_subdivision_value(value: str) -> str:
+    return normalize_subdivision_query(_clean_value(value))
+
+
 def _resolve_subject(value: str, *, full_message: str = "") -> str:
     """Normalize noisy natural-language input down to an address, name, or PIN subject."""
     source = full_message or value
+    if looks_like_count_query(source):
+        return _clean_value(strip_question_wrapper(source))
     subject, hint = extract_search_subject(source)
-    if subject and hint in {"address", "pin", "street", "name"}:
+    if subject and hint in {"address", "pin", "street"}:
+        return subject
+    if hint == "name" and full_message and (
+        _looks_like_subdivision_reference(full_message) or looks_like_count_query(full_message)
+    ):
+        return _clean_value(strip_question_wrapper(full_message))
+    if subject and hint == "name":
         return subject
     return _clean_value(strip_question_wrapper(value))
 
@@ -224,7 +279,17 @@ def _looks_like_parcel_id(text: str) -> bool:
 
 def _looks_like_subdivision_reference(text: str) -> bool:
     lower = text.lower()
-    return "subdivision" in lower or re.search(r"\bsub(?:division)?\b", lower)
+    return "subdivision" in lower or bool(re.search(r"\bsub(?:division|d)?\b", lower))
+
+
+def _subdivision_parcels_intent(value: str, *, description: str = "") -> QueryIntent:
+    cleaned = _clean_subdivision_value(value)
+    return QueryIntent(
+        intent_type="subdivision_parcels",
+        field="SubName",
+        value=cleaned,
+        description=description or f"Parcels in subdivision {cleaned}",
+    )
 
 
 def _looks_like_address(text: str) -> bool:
@@ -238,13 +303,15 @@ def _looks_like_address(text: str) -> bool:
 
 def _extract_subdivision_name(text: str) -> str | None:
     for pattern in (
+        SUBDIVISION_PARCEL_COUNT_PATTERN,
         SUBDIVISION_ADDRESS_COUNT_PATTERN,
         SUBDIVISION_PARCEL_PATTERN,
-        re.compile(r"(?:in|inside|within)\s+(?:subdivision|sub(?:division)?)\s+(.+)", re.I),
+        re.compile(r"(?:in|inside|within)\s+(?:sub(?:division|d)?)\s+(.+)", re.I),
+        re.compile(r"(?:in|inside|within)\s+(.+?)\s+sub(?:division|d)?\.?\s*$", re.I),
     ):
         match = pattern.search(text)
         if match:
-            return _clean_value(match.group(1))
+            return _clean_subdivision_value(match.group(1))
     return None
 
 
@@ -255,7 +322,19 @@ def _intent_for_subject(value: str, *, context_focus: str = "", full_message: st
 
     subdivision = _extract_subdivision_name(cleaned) or _extract_subdivision_name(message)
     if subdivision:
-        if re.search(r"\b(?:address|house|home)s?\b", value, re.I):
+        lower = (message or cleaned).lower()
+        wants_addresses = bool(re.search(r"\b(?:address|house|home)s?\b", lower))
+        wants_parcels = looks_like_parcel_word(message or cleaned) or bool(
+            re.search(r"\b(?:property|properties|owner)s?\b", lower)
+        )
+        if wants_addresses and wants_parcels:
+            return QueryIntent(
+                intent_type="subdivision_both",
+                field="SubName",
+                value=subdivision,
+                description=f"Parcels and addresses in subdivision {subdivision}",
+            )
+        if wants_addresses:
             return QueryIntent(
                 intent_type="subdivision_addresses",
                 field="SUBNAME",
@@ -306,6 +385,11 @@ def _intent_for_subject(value: str, *, context_focus: str = "", full_message: st
             description=description,
             context_focus=focus,
         )
+
+    if looks_like_count_query(message or cleaned):
+        subdivision = _extract_subdivision_name(message) or _extract_subdivision_name(cleaned)
+        if subdivision:
+            return _subdivision_parcels_intent(subdivision)
 
     return QueryIntent(
         intent_type="owner",
@@ -389,6 +473,75 @@ def parse_query(message: str) -> QueryIntent | None:
         if quick.intent_type == "address":
             return quick
 
+    if (
+        LIST_SUBDIVISIONS_PATTERN.search(stripped)
+        or LIST_SUBDIVISIONS_PATTERN.search(text)
+        or COUNT_SUBDIVISIONS_PATTERN.search(stripped)
+        or COUNT_SUBDIVISIONS_PATTERN.search(text)
+        or COUNT_SUBDIVISIONS_IN_ROWAN_PATTERN.search(stripped)
+        or COUNT_SUBDIVISIONS_IN_ROWAN_PATTERN.search(text)
+    ):
+        return QueryIntent(
+            intent_type="list_subdivisions",
+            field="SubName",
+            value="",
+            description="Count approved major subdivisions in Rowan County",
+        )
+
+    subdivision_both = SUBDIVISION_BOTH_PATTERN.search(stripped) or SUBDIVISION_BOTH_PATTERN.search(text)
+    if subdivision_both:
+        value = _clean_subdivision_value(subdivision_both.group(1))
+        return QueryIntent(
+            intent_type="subdivision_both",
+            field="SubName",
+            value=value,
+            description=f"Parcels and addresses in subdivision {value}",
+        )
+
+    subdivision_parcels_in = SUBDIVISION_PARCELS_IN_PATTERN.search(stripped)
+    if subdivision_parcels_in:
+        value = _clean_subdivision_value(subdivision_parcels_in.group(1))
+        if not _looks_like_address(value) and not _looks_like_parcel_id(value):
+            return _subdivision_parcels_intent(value)
+
+    subdivision_parcel_count = SUBDIVISION_PARCEL_COUNT_PATTERN.search(stripped)
+    if not subdivision_parcel_count and looks_like_count_query(stripped) and looks_like_parcel_word(stripped):
+        subdivision_parcel_count = re.search(
+            r"how many\s+(?:parcels?|parcle|parcell|parcesl|parceles|properties)(?: are)?"
+            r"(?: in| inside| within)\s+(.+?)\??$",
+            stripped,
+            re.I,
+        )
+    if subdivision_parcel_count:
+        value = _clean_subdivision_value(subdivision_parcel_count.group(1))
+        if (
+            _looks_like_subdivision_reference(stripped)
+            or _looks_like_subdivision_reference(value)
+            or not _looks_like_address(value)
+        ):
+            return _subdivision_parcels_intent(value)
+
+    subdivision_addresses_in = SUBDIVISION_ADDRESSES_IN_PATTERN.search(stripped)
+    if subdivision_addresses_in:
+        value = _clean_subdivision_value(subdivision_addresses_in.group(1))
+        if not _looks_like_address(value):
+            return QueryIntent(
+                intent_type="subdivision_addresses",
+                field="SubName",
+                value=value,
+                description=f"Addresses in subdivision {value}",
+            )
+
+    subdivision_name = SUBDIVISION_NAME_PATTERN.search(stripped)
+    if subdivision_name:
+        value = _clean_subdivision_value(subdivision_name.group(1))
+        return QueryIntent(
+            intent_type="subdivision_parcels",
+            field="SubName",
+            value=value,
+            description=f"Parcels in subdivision {value}",
+        )
+
     subdivision_addr = SUBDIVISION_ADDRESS_COUNT_PATTERN.search(stripped)
     if subdivision_addr:
         value = _clean_value(subdivision_addr.group(1))
@@ -423,8 +576,17 @@ def parse_query(message: str) -> QueryIntent | None:
         )
 
     street_parcels_count = STREET_PARCEL_COUNT_PATTERN.search(stripped)
+    if not street_parcels_count and looks_like_count_query(stripped) and looks_like_parcel_word(stripped):
+        street_parcels_count = re.search(
+            r"how many\s+(?:parcels?|parcle|parcell|parcesl|parceles|properties)(?: are)?"
+            r"(?: on| along| in)?\s+(.+?)\??$",
+            stripped,
+            re.I,
+        )
     if street_parcels_count:
-        value = _clean_value(street_parcels_count.group(1))
+        value = _clean_subdivision_value(street_parcels_count.group(1))
+        if _looks_like_subdivision_reference(stripped) or _looks_like_subdivision_reference(value):
+            return _subdivision_parcels_intent(value)
         return QueryIntent(
             intent_type="street_parcels",
             field="ST_NAME",
@@ -435,6 +597,16 @@ def parse_query(message: str) -> QueryIntent | None:
     who_owns = WHO_OWNS_PATTERN.search(text)
     if who_owns:
         return _intent_for_subject(who_owns.group(1), full_message=text)
+
+    does_own = DOES_OWN_PATTERN.search(stripped) or DOES_OWN_PATTERN.search(text)
+    if does_own:
+        value = _clean_value(does_own.group(1))
+        return QueryIntent(
+            intent_type="owner",
+            field="OWNNAME",
+            value=value,
+            description=f"Parcels owned by {value}",
+        )
 
     find_owning = FIND_OWNING_PATTERN.search(stripped) or FIND_OWNING_PATTERN.search(text)
     if find_owning:
@@ -448,7 +620,8 @@ def parse_query(message: str) -> QueryIntent | None:
 
     owner_match = OWNER_PATTERN.search(stripped) or OWNER_SHORT_PATTERN.search(stripped)
     if owner_match:
-        return _intent_for_subject(owner_match.group(1), full_message=text)
+        owner_value = re.sub(r"^(?:owner|owned by)\s+", "", owner_match.group(1).strip(), flags=re.I)
+        return _intent_for_subject(owner_value, full_message=text)
 
     street_match = STREET_PARCEL_PATTERN.search(stripped)
     if street_match:
@@ -473,6 +646,17 @@ def parse_query(message: str) -> QueryIntent | None:
         return _parcel_lookup_intent(parcel_id, context_focus=focus)
 
     if len(stripped) >= 3:
+        if (
+            COUNT_SUBDIVISIONS_PATTERN.search(stripped)
+            or COUNT_SUBDIVISIONS_IN_ROWAN_PATTERN.search(stripped)
+            or LIST_SUBDIVISIONS_PATTERN.search(stripped)
+        ):
+            return QueryIntent(
+                intent_type="list_subdivisions",
+                field="SubName",
+                value="",
+                description="Count approved major subdivisions in Rowan County",
+            )
         intent = _intent_for_subject(stripped, full_message=text)
         if intent.intent_type != "owner" or not focus:
             return intent
@@ -518,13 +702,7 @@ def build_where_clause(intent: QueryIntent) -> str:
         return f"({' OR '.join(dict.fromkeys(clauses))})"
 
     if intent.intent_type == "owner":
-        tokens = _extract_tokens(value)
-        if not tokens:
-            return f"UPPER(OWNNAME) LIKE '%{value.upper()}%'"
-        if len(tokens) >= 2:
-            return " AND ".join(f"UPPER(OWNNAME) LIKE '%{token}%'" for token in tokens)
-        token = tokens[0]
-        return f"UPPER(OWNNAME) LIKE '%{token}%'"
+        return build_owner_where_clause(value)
 
     if intent.intent_type in {"street_parcels", "street"}:
         tokens = _extract_tokens(value)

@@ -38,20 +38,25 @@ from services.rowan_address_search import search_rowan_address
 from services.chat_log import get_summary_stats, init_db, list_queries, log_query, set_needs_feature
 from services.nconemap_geocoder import GeocodeError
 from services.parcel_address_lookup import geocode_from_parcel_feature, lookup_parcel_by_address
+from services.owner_search import build_owner_where_clause, combined_owner_name, owner_matches_query
+from services.parcel_facts import format_parcel_attribute_lines
 from services.parcel_report import format_property_details
 from services.rod_links import format_deed_record_line, format_plat_record_line
 from services.query_parser import QueryIntent, build_where_clause, parse_query, retry_intent_from_message
 from services.text_normalize import fuzzy_score, parse_address_parts, parse_city_from_query
 from services.search_layers import (
     addresses_in_subdivision,
+    canonical_subdivision_name,
     count_addresses_on_street,
-    enrich_parcel_report_flood,
-    enrich_parcel_report_city_limits,
+    enrich_parcel_report_context,
     identify_parcel_report_at_point,
+    list_approved_subdivisions,
     parcels_in_subdivision,
+    parcels_and_addresses_in_subdivision,
     query_parcel_report_by_polygon,
     search_street_centerlines,
     search_subdivision,
+    suggest_subdivision_name,
 )
 
 load_dotenv(override=True)
@@ -78,6 +83,10 @@ ALLOWED_USERS = [
 ARCGIS_BASEMAP_URL = os.getenv(
     "ARCGIS_BASEMAP_URL",
     "https://gis.rowancountync.gov/arcgis/rest/services/Public/MapViewer/MapServer",
+)
+ARCGIS_PICTOMETRY_URL = os.getenv(
+    "ARCGIS_PICTOMETRY_URL",
+    "https://gis.rowancountync.gov/arcgis/rest/services/Pictometry/Pictometry2025/MapServer",
 )
 ARCGIS_WEBMAP_ITEM_ID = os.getenv("ARCGIS_WEBMAP_ITEM_ID", "").strip()
 ARCGIS_PORTAL_URL = os.getenv(
@@ -166,6 +175,8 @@ def _geocode_for_address_query(address: str) -> dict | None:
 def _geocode_source_label(geocode: dict | None) -> str:
     if not geocode:
         return ""
+    if geocode.get("source") == "map_click":
+        return "Map click"
     if geocode.get("source") == "tax_parcel":
         return "Rowan County tax parcel records"
     if geocode.get("source") == "rowan_addressing":
@@ -331,33 +342,40 @@ def _fetch_parcel_report(geojson: dict, geocode: dict | None) -> dict | None:
     if not parcel_features:
         return report
 
-    report = enrich_parcel_report_flood(report, geojson)
-    return enrich_parcel_report_city_limits(report, geojson)
+    report = enrich_parcel_report_context(report, geojson)
+    return report
 
 
 def _fuzzy_owner_search(name: str) -> dict:
     """Broaden owner search when exact token matching finds nothing."""
-    import re
+    from services.owner_search import extract_owner_tokens
 
-    tokens = [
-        token for token in re.findall(r"[A-Za-z0-9]+", name.upper())
-        if len(token) >= 3 and token not in {"THE", "AND", "FOR", "OWN", "OWNING", "PROPERTY"}
-    ]
+    tokens = extract_owner_tokens(name)
     if not tokens:
         return {"type": "FeatureCollection", "features": []}
 
     longest = max(tokens, key=len).replace("'", "''")
-    broad = query_layer(
+    broad_clauses = [
         f"UPPER(OWNNAME) LIKE '%{longest}%'",
-        result_record_count=50,
+        f"UPPER(OWN2) LIKE '%{longest}%'",
+    ]
+    broad = query_layer(
+        f"({' OR '.join(broad_clauses)})",
+        result_record_count=75,
     )
     matched = []
     for feature in broad.get("features") or []:
-        owner = (feature.get("properties") or {}).get("OWNNAME") or ""
-        if fuzzy_score(name, owner) >= 0.62:
+        props = feature.get("properties") or {}
+        if owner_matches_query(name, props):
             matched.append(feature)
 
-    return {"type": "FeatureCollection", "features": matched}
+    if matched:
+        return {"type": "FeatureCollection", "features": matched}
+
+    try:
+        return query_layer(build_owner_where_clause(name), result_record_count=50)
+    except ArcGISQueryError:
+        return {"type": "FeatureCollection", "features": []}
 
 
 def _narrow_parcel_results(
@@ -412,11 +430,20 @@ def _narrow_parcel_results(
 def _format_summary_message(intent, summaries, result_count, geocode=None, parcel_report=None):
     source_label = _geocode_source_label(geocode)
 
-    def _value_line(row: dict) -> str:
-        value = row.get("TOT_VAL")
-        if isinstance(value, (int, float)):
-            return f"Total value: ${value:,.0f}"
-        return ""
+    def _fact_lines(row: dict, parcel_report_data=None) -> list[str]:
+        lines = format_parcel_attribute_lines(row)
+        if any(line.startswith("ZIP:") for line in lines):
+            return lines
+        if not parcel_report_data:
+            return lines
+        for item in (parcel_report_data.get("results") or []):
+            if item.get("layerName") != "ZIP Code":
+                continue
+            zip_code = (item.get("attributes") or {}).get("ZIP_CODE")
+            if zip_code:
+                lines.append(f"ZIP: {zip_code}")
+            break
+        return lines
 
     def _deed_line(row: dict) -> str:
         return format_deed_record_line(row.get("DEEDBOOK"), row.get("DEEDPAGE"))
@@ -456,27 +483,71 @@ def _format_summary_message(intent, summaries, result_count, geocode=None, parce
         if result_count == 1:
             row = summaries[0]
             pin = row.get("PIN") or row.get("PARCEL_ID") or "Unknown"
-            owner = row.get("OWNNAME") or "Unknown owner"
+            owner = combined_owner_name(row)
             return f"Found 1 parcel on {street}: {pin} — {owner}."
         return f"Found {result_count} parcels on {street}."
+
+    if intent.intent_type == "list_subdivisions":
+        if result_count == 0:
+            return "No approved major subdivisions were found in Rowan County GIS."
+        names = sorted({
+            str((row.get("SubName") or row.get("SUBNAME") or "")).strip()
+            for row in summaries
+            if str((row.get("SubName") or row.get("SUBNAME") or "")).strip()
+        })
+        preview = "\n".join(f"• {name}" for name in names[:40])
+        extra = f"\n… and {len(names) - 40} more." if len(names) > 40 else ""
+        return (
+            f"Rowan County has {len(names)} approved major subdivisions.\n"
+            f"{preview}{extra}"
+        )
 
     if intent.intent_type == "subdivision_addresses":
         sub = intent.value
         if result_count == 0:
-            return f"No addresses found in subdivision {sub}."
+            suggestion = suggest_subdivision_name(sub)
+            if suggestion and suggestion.upper() != sub.upper():
+                return (
+                    f'No addresses found for "{sub}". '
+                    f'Did you mean subdivision **{suggestion}**? '
+                    f'Try: how many addresses in {suggestion}'
+                )
+            return f'No subdivision matching "{sub}" was found.'
         label = "address" if result_count == 1 else "addresses"
         return f"Found {result_count} {label} in subdivision {sub}."
+
+    if intent.intent_type == "subdivision_both":
+        sub = intent.value
+        if result_count == 0:
+            suggestion = suggest_subdivision_name(sub)
+            if suggestion and suggestion.upper() != sub.upper():
+                return (
+                    f'No results for "{sub}". '
+                    f'Did you mean subdivision **{suggestion}**?'
+                )
+            return f'No subdivision matching "{sub}" was found.'
+        return (
+            f"Found {result_count} parcels and/or addresses in subdivision {sub}. "
+            "Green polygons are tax parcels; blue markers are address points."
+        )
 
     if intent.intent_type == "subdivision_parcels":
         sub = intent.value
         if result_count == 0:
-            return f"No parcels found in subdivision {sub}."
+            suggestion = suggest_subdivision_name(sub)
+            if suggestion and suggestion.upper() != sub.upper():
+                return (
+                    f'No parcels found for "{sub}". '
+                    f'Did you mean subdivision **{suggestion}**? '
+                    f'Try: how many parcels in {suggestion}'
+                )
+            return f'No subdivision matching "{sub}" was found.'
         if result_count == 1:
             row = summaries[0]
             pin = row.get("PIN") or row.get("PARCEL_ID") or "Unknown"
-            owner = row.get("OWNNAME") or "Unknown owner"
+            owner = combined_owner_name(row)
             return f"Found 1 parcel in {sub}: {pin} — {owner}."
-        owners = sorted({row.get("OWNNAME") for row in summaries if row.get("OWNNAME")})
+        owners = sorted({combined_owner_name(row) for row in summaries if combined_owner_name(row) != "Unknown owner"})
         owner_preview = ", ".join(owners[:5])
         if len(owners) > 5:
             owner_preview += f", and {len(owners) - 5} more"
@@ -496,9 +567,8 @@ def _format_summary_message(intent, summaries, result_count, geocode=None, parce
     if result_count == 1:
         row = summaries[0]
         pin = row.get("PIN") or row.get("PARCEL_ID") or "Unknown"
-        owner = row.get("OWNNAME") or "Unknown owner"
+        owner = combined_owner_name(row)
         location = _location_line(row)
-        value_text = _value_line(row)
         subject = location
 
         blocks = []
@@ -507,13 +577,14 @@ def _format_summary_message(intent, summaries, result_count, geocode=None, parce
             blocks.extend(_detail_block(focus=intent.context_focus, parcel_pin=pin if pin != "Unknown" else None))
             blocks.append("")
             blocks.append(f"Parcel {pin}")
+        elif intent.intent_type == "map_click":
+            blocks.append(f"Map parcel {pin}")
         else:
             blocks.append(f"Found parcel {pin}")
 
         blocks.append(f"Owner: {owner}")
         blocks.append(f"Address: {location}")
-        if value_text:
-            blocks.append(value_text)
+        blocks.extend(_fact_lines(row, parcel_report))
         blocks.extend(_record_lines(row))
 
         if not intent.context_focus:
@@ -523,7 +594,10 @@ def _format_summary_message(intent, summaries, result_count, geocode=None, parce
                 blocks.extend(detail_lines)
 
         blocks.append("")
-        blocks.append(f"Located via {source_label} at {location}.")
+        if intent.intent_type == "map_click":
+            blocks.append("Selected on the map.")
+        else:
+            blocks.append(f"Located via {source_label} at {location}.")
 
         return _join(blocks)
 
@@ -538,8 +612,10 @@ def _layer_used_for_intent(intent: QueryIntent) -> str:
         "address": "Public/search/MapServer/0",
         "street_houses": "Public/search/MapServer/1 + 0",
         "street_parcels": "Public/RowanTaxParcels/MapServer/0",
-        "subdivision_addresses": "Public/search/MapServer/3 + 0",
-        "subdivision_parcels": "Public/search/MapServer/3 + RowanTaxParcels",
+        "subdivision_addresses": "Public/IntranetMap/MapServer/27 + search/0",
+        "subdivision_parcels": "Public/IntranetMap/MapServer/27 + RowanTaxParcels",
+        "subdivision_both": "Public/IntranetMap/MapServer/27 + RowanTaxParcels + search/0",
+        "list_subdivisions": "Public/IntranetMap/MapServer/27",
     }
     return mapping.get(intent.intent_type, "RowanTaxParcels")
 
@@ -557,13 +633,25 @@ def _query_for_intent(intent: QueryIntent):
             overlay_geojson = streets
         return geojson, geocode, parcel_report, overlay_geojson
 
+    if intent.intent_type == "list_subdivisions":
+        geojson = list_approved_subdivisions()
+        return geojson, geocode, parcel_report, overlay_geojson
+
     if intent.intent_type == "subdivision_addresses":
         subdivisions = search_subdivision(intent.value)
+        intent.value = canonical_subdivision_name(subdivisions, intent.value)
         geojson = addresses_in_subdivision(intent.value)
+        return geojson, geocode, parcel_report, subdivisions
+
+    if intent.intent_type == "subdivision_both":
+        subdivisions = search_subdivision(intent.value)
+        intent.value = canonical_subdivision_name(subdivisions, intent.value)
+        geojson = parcels_and_addresses_in_subdivision(intent.value)
         return geojson, geocode, parcel_report, subdivisions
 
     if intent.intent_type == "subdivision_parcels":
         subdivisions = search_subdivision(intent.value)
+        intent.value = canonical_subdivision_name(subdivisions, intent.value)
         geojson = parcels_in_subdivision(intent.value)
         return geojson, geocode, parcel_report, subdivisions
 
@@ -621,6 +709,117 @@ def _query_parcels_for_intent(intent):
     """Backward-compatible wrapper."""
     geojson, geocode, _, _ = _query_for_intent(intent)
     return geojson, geocode
+
+
+def _parcel_centroid_distance(feature: dict, longitude: float, latitude: float) -> float:
+    geometry = feature.get("geometry") or {}
+    coords = geometry.get("coordinates")
+    if not coords:
+        return float("inf")
+
+    points: list[tuple[float, float]] = []
+
+    def collect(part) -> None:
+        if not part:
+            return
+        if isinstance(part[0], (int, float)):
+            points.append((float(part[0]), float(part[1])))
+            return
+        for item in part:
+            collect(item)
+
+    collect(coords)
+    if not points:
+        return float("inf")
+
+    center_lon = sum(point[0] for point in points) / len(points)
+    center_lat = sum(point[1] for point in points) / len(points)
+    return (center_lon - longitude) ** 2 + (center_lat - latitude) ** 2
+
+
+def _single_parcel_at_point(geojson: dict, longitude: float, latitude: float) -> dict:
+    features = geojson.get("features") or []
+    if len(features) <= 1:
+        return geojson
+
+    best = min(
+        features,
+        key=lambda feature: _parcel_centroid_distance(feature, longitude, latitude),
+    )
+    return {"type": "FeatureCollection", "features": [best]}
+
+
+def _query_parcel_at_point(longitude: float, latitude: float) -> tuple[dict, dict | None, dict | None]:
+    """Find the tax parcel at a map coordinate and enrich with ParcelReport context."""
+    geocode = {
+        "address": f"Map click ({latitude:.5f}, {longitude:.5f})",
+        "location": {"x": longitude, "y": latitude},
+        "source": "map_click",
+        "score": 100,
+    }
+    geojson = query_layer_at_point(longitude, latitude, distance_feet=25)
+    geojson = _single_parcel_at_point(geojson, longitude, latitude)
+
+    parcel_report = None
+    if len(geojson.get("features", [])) == 1:
+        try:
+            parcel_report = _fetch_parcel_report(geojson, geocode)
+        except requests.RequestException as exc:
+            logger.warning("ParcelReport identify failed for map click: %s", exc)
+
+    return geojson, geocode, parcel_report
+
+
+def _build_api_response(
+    *,
+    intent: QueryIntent,
+    geojson: dict,
+    geocode: dict | None,
+    parcel_report: dict | None,
+    overlay_geojson: dict | None,
+    session_id: str,
+    user_message: str,
+    started: float,
+) -> tuple[dict, int]:
+    summaries = summarize_features(geojson)
+    result_count = len(geojson.get("features", []))
+    map_geojson = _with_address_point(geojson, geocode) if geocode else geojson
+    elapsed_ms = int((time.perf_counter() - started) * 1000)
+    status = "success" if result_count else "no_results"
+
+    log_query(
+        session_id=session_id,
+        user_message=user_message,
+        parse_method="regex" if intent.intent_type != "map_click" else "map_click",
+        intent_type=intent.intent_type,
+        intent=intent.to_dict(),
+        status=status,
+        result_count=result_count,
+        layer_used=_layer_used_for_intent(intent)
+        if intent.intent_type != "map_click"
+        else "RowanTaxParcels/map_click",
+        response_ms=elapsed_ms,
+    )
+
+    message = _format_summary_message(intent, summaries, result_count, geocode, parcel_report)
+    if result_count == 0 and intent.intent_type == "map_click":
+        message = "No tax parcel was found at that map location. Try clicking closer to a parcel boundary."
+
+    map_target = _build_map_target(map_geojson, geocode) if result_count else None
+    payload = {
+        "status": status,
+        "message": message,
+        "intent": intent.to_dict(),
+        "geojson": map_geojson,
+        "overlay_geojson": overlay_geojson,
+        "summaries": summaries,
+        "result_count": result_count,
+        "geocode": geocode,
+        "parcel_report": parcel_report,
+        "map_target": map_target,
+    }
+    http_status = 200 if result_count else 404
+    return payload, http_status
 
 
 @app.route("/login")
@@ -731,6 +930,7 @@ def index():
     return render_template(
         "chat.html",
         basemap_url=ARCGIS_BASEMAP_URL,
+        pictometry_url=ARCGIS_PICTOMETRY_URL,
         webmap_item_id=ARCGIS_WEBMAP_ITEM_ID,
         portal_url=ARCGIS_PORTAL_URL,
     )
@@ -739,7 +939,11 @@ def index():
 @app.route("/health")
 def health():
     """Health check endpoint."""
-    return jsonify({"status": "healthy", "app": "rowan-gis-chatbot"})
+    return jsonify({
+        "status": "healthy",
+        "app": "rowan-gis-chatbot",
+        "build": "2026.06.17-parser47",
+    })
 
 
 @app.route("/api/layers")
@@ -862,6 +1066,73 @@ def api_query():
         ), 502
 
 
+@app.route("/api/parcel-at-point", methods=["POST"])
+def api_parcel_at_point():
+    """Look up the tax parcel at a map click coordinate."""
+    started = time.perf_counter()
+    payload = request.get_json(silent=True) or {}
+    session_id = (payload.get("session_id") or "anonymous").strip()[:64]
+
+    try:
+        longitude = float(payload.get("longitude"))
+        latitude = float(payload.get("latitude"))
+    except (TypeError, ValueError):
+        return jsonify({"error": "longitude and latitude are required numbers."}), 400
+
+    if not (-84.5 <= longitude <= -79.0 and 33.0 <= latitude <= 37.5):
+        return jsonify(
+            {
+                "status": "no_results",
+                "message": "That map location is outside Rowan County.",
+                "geojson": {"type": "FeatureCollection", "features": []},
+                "summaries": [],
+                "result_count": 0,
+            }
+        ), 404
+
+    intent = QueryIntent(
+        intent_type="map_click",
+        field="PIN",
+        value=f"{latitude:.5f},{longitude:.5f}",
+        description=f"Parcel at map click ({latitude:.5f}, {longitude:.5f})",
+    )
+    user_message = f"Map click ({latitude:.5f}, {longitude:.5f})"
+
+    try:
+        geojson, geocode, parcel_report = _query_parcel_at_point(longitude, latitude)
+        response_payload, http_status = _build_api_response(
+            intent=intent,
+            geojson=geojson,
+            geocode=geocode,
+            parcel_report=parcel_report,
+            overlay_geojson=None,
+            session_id=session_id,
+            user_message=user_message,
+            started=started,
+        )
+        return jsonify(response_payload), http_status
+    except (ArcGISQueryError, requests.RequestException, ValueError) as exc:
+        elapsed_ms = int((time.perf_counter() - started) * 1000)
+        logger.error("Map click lookup failed: %s", exc)
+        log_query(
+            session_id=session_id,
+            user_message=user_message,
+            parse_method="map_click",
+            intent_type="map_click",
+            intent=intent.to_dict(),
+            status="error",
+            error_message=str(exc),
+            response_ms=elapsed_ms,
+        )
+        return jsonify(
+            {
+                "status": "error",
+                "message": "Something went wrong looking up that map location. Please try again.",
+                "error": str(exc),
+            }
+        ), 502
+
+
 @app.route("/admin/queries")
 @require_admin_auth
 def admin_queries():
@@ -949,4 +1220,4 @@ def admin_flag_query(entry_id):
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5002))
     debug_mode = os.getenv("ENVIRONMENT", "production") == "development"
-    app.run(debug=debug_mode, host="0.0.0.0", port=port, use_reloader=debug_mode)
+    app.run(debug=debug_mode, host="0.0.0.0", port=port, use_reloader=False)

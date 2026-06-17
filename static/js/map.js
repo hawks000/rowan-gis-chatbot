@@ -4,19 +4,19 @@ let mapView = null;
 let resultsLayer = null;
 let geocodeLayer = null;
 let mapReadyPromise = null;
-let activeZoomId = 0;
 let lastDrawFeatures = [];
 let lastGeocode = null;
 let lastMapTarget = null;
 let mapClickHandler = null;
+let basemapLayer = null;
+let pictometryLayer = null;
 
 const DEFAULT_SUGGESTIONS = [
+    "How many subdivisions are in Rowan County",
     "Who owns 550 MT HALL RD",
-    "Find Earl Hawks owning property",
-    "PIN 5733-04-51-7482",
     "How many parcels on Woodleaf",
-    "How many houses on Main Street",
-    "How many addresses in subdivision Oak Hills",
+    "PIN 5733-04-51-7482",
+    "Parcels in Grand Oaks",
 ];
 
 function getConfig() {
@@ -215,272 +215,162 @@ async function waitForBasemap() {
     await Promise.all(waits);
 }
 
-async function projectGeometriesToView(geometries) {
-    if (!geometries.length) {
-        return [];
-    }
+const GO_TO_OPTIONS = { duration: 0 };
 
-    const [projection] = await loadModules(["esri/geometry/projection"]);
-    await projection.load();
-    const viewSR = mapView.spatialReference;
-
-    return geometries
-        .map((geometry) => {
-            if (!geometry) {
-                return null;
-            }
-            if (geometry.spatialReference && geometry.spatialReference.wkid === viewSR.wkid) {
-                return geometry;
-            }
-            return projection.project(geometry, viewSR);
-        })
-        .filter(Boolean);
+function scaleForZoomLevel(zoom) {
+    return 591657527.591555 / (2 ** zoom);
 }
 
-function zoomLevelForScale(scale) {
-    if (!scale || scale > 12000) {
-        return 14;
+function zoomLevelForSpan(span) {
+    if (!span || !Number.isFinite(span)) {
+        return 18;
     }
-    if (scale > 6000) {
+    if (span > 0.08) {
+        return 11;
+    }
+    if (span > 0.03) {
+        return 13;
+    }
+    if (span > 0.01) {
         return 15;
     }
-    if (scale > 3000) {
+    if (span > 0.003) {
         return 16;
     }
-    return 17;
+    return 18;
 }
 
-async function zoomToGeographicCenter(mapTarget, zoomId) {
-    if (!mapTarget || !mapTarget.center || zoomId !== activeZoomId || !mapView) {
-        return false;
+async function forceViewToLonLat(longitude, latitude, zoom = 18) {
+    if (!mapView || !Number.isFinite(longitude) || !Number.isFinite(latitude)) {
+        return;
     }
 
-    const zoom = zoomLevelForScale(mapTarget.scale);
+    const scale = 591657527.591555 / (2 ** zoom);
+
     try {
-        await mapView.goTo(
-            {
-                center: [mapTarget.center.x, mapTarget.center.y],
-                zoom,
-            },
-            { duration: 700, easing: "ease-in-out" },
-        );
-        return true;
-    } catch (error) {
-        if (error && error.name !== "AbortError") {
-            console.warn("Geographic center/zoom fallback failed:", error);
-        }
-    }
-    return false;
-}
+        await mapView.when();
 
-async function zoomToMapTarget(mapTarget, zoomId) {
-    if (!mapTarget || zoomId !== activeZoomId || !mapView) {
-        return false;
-    }
-
-    await waitForBasemap();
-    mapView.resize();
-
-    const [Extent, Point, projection] = await loadModules([
-        "esri/geometry/Extent",
-        "esri/geometry/Point",
-        "esri/geometry/projection",
-    ]);
-    await projection.load();
-
-    const viewSR = mapView.spatialReference;
-    const padding = { top: 60, bottom: 60, left: 60, right: 60 };
-
-    if (mapTarget.extent) {
-        const extent = new Extent({
-            xmin: mapTarget.extent.xmin,
-            ymin: mapTarget.extent.ymin,
-            xmax: mapTarget.extent.xmax,
-            ymax: mapTarget.extent.ymax,
-            spatialReference: { wkid: mapTarget.extent.wkid || 4326 },
-        });
-        const projectedExtent = projection.project(extent, viewSR);
-        if (projectedExtent) {
-            try {
-                await mapView.goTo(projectedExtent.expand(1.3), { duration: 700, easing: "ease-in-out" });
-                return true;
-            } catch (error) {
-                if (error && error.name !== "AbortError") {
-                    console.warn("Projected extent zoom failed:", error);
-                }
-            }
-        }
-    }
-
-    if (mapTarget.center) {
+        const [Point] = await loadModules(["esri/geometry/Point"]);
         const point = new Point({
-            longitude: mapTarget.center.x,
-            latitude: mapTarget.center.y,
+            longitude,
+            latitude,
             spatialReference: { wkid: 4326 },
         });
-        const projectedPoint = projection.project(point, viewSR);
-        const scale = mapTarget.scale || 2400;
-        if (projectedPoint) {
-            try {
-                await mapView.goTo({ target: projectedPoint, scale }, { duration: 700, easing: "ease-in-out" });
-                return true;
-            } catch (error) {
-                if (error && error.name !== "AbortError") {
-                    console.warn("Projected center zoom failed:", error);
-                }
-            }
-        }
-    }
 
-    return zoomToGeographicCenter(mapTarget, zoomId);
-}
-
-async function zoomToGraphics(graphics, zoomId) {
-    if (!graphics.length || zoomId !== activeZoomId) {
-        return false;
-    }
-
-    await waitForBasemap();
-    mapView.resize();
-
-    const padding = { top: 60, bottom: 60, left: 60, right: 60 };
-    const geometries = graphics.map((graphic) => graphic.geometry).filter(Boolean);
-    const projectedGeometries = await projectGeometriesToView(geometries);
-
-    try {
-        if (projectedGeometries.length === 1 && projectedGeometries[0].type === "point") {
-            await mapView.goTo({ target: projectedGeometries[0], scale: 2400 }, { duration: 700 });
-            return true;
-        }
-        if (projectedGeometries.length) {
-            await mapView.goTo({ target: projectedGeometries, padding }, { duration: 700, easing: "ease-in-out" });
-            return true;
-        }
-    } catch (error) {
-        if (error && error.name === "AbortError") {
-            return true;
-        }
-        console.warn("Projected graphics goTo failed, trying extent:", error);
-    }
-
-    if (zoomId !== activeZoomId) {
-        return false;
-    }
-
-    try {
-        const [geometryEngine] = await loadModules(["esri/geometry/geometryEngine"]);
-        if (projectedGeometries.length === 1 && projectedGeometries[0].type === "point") {
-            await mapView.goTo({ target: projectedGeometries[0], zoom: 18 }, { duration: 600 });
-            return true;
-        }
-
-        const union = geometryEngine.union(projectedGeometries);
-        if (union && union.extent) {
-            await mapView.goTo(union.extent.expand(1.35), { duration: 600 });
-            return true;
-        }
+        await mapView.goTo({ center: point, scale }, { animate: false, duration: 0 });
+        mapView.center = point;
+        mapView.scale = scale;
     } catch (error) {
         if (error && error.name !== "AbortError") {
-            console.warn("Extent zoom failed:", error);
+            console.warn("Map zoom failed:", error);
         }
     }
-
-    return false;
 }
 
-async function zoomToCenterTarget(target, zoomId) {
-    if (!target || zoomId !== activeZoomId) {
-        return false;
-    }
-
-    const [Point, projection] = await loadModules([
-        "esri/geometry/Point",
-        "esri/geometry/projection",
-    ]);
-
-    await projection.load();
-
-    const geographicPoint = new Point({
-        longitude: target.longitude,
-        latitude: target.latitude,
-        spatialReference: { wkid: 4326 },
-    });
-
-    const scale = scaleForSpan(target.span);
-    const viewPoint = projection.project(geographicPoint, mapView.spatialReference);
-
-    try {
-        if (viewPoint) {
-            await mapView.goTo({ target: viewPoint, scale }, { duration: 700, easing: "ease-in-out" });
-            return true;
-        }
-    } catch (error) {
-        if (error && error.name === "AbortError") {
-            return true;
-        }
-        console.warn("Projected center zoom failed:", error);
-    }
-
-    if (zoomId !== activeZoomId) {
-        return false;
-    }
-
-    try {
-        await mapView.goTo(
-            {
-                center: [target.longitude, target.latitude],
-                zoom: scale <= 3000 ? 18 : 15,
-            },
-            { duration: 500 },
-        );
-        return true;
-    } catch (fallbackError) {
-        if (fallbackError && fallbackError.name !== "AbortError") {
-            console.warn("Geographic center zoom failed:", fallbackError);
-        }
-    }
-
-    return false;
+function geometryExtent(geometry) {
+    return geometry && geometry.extent ? geometry.extent : null;
 }
 
-async function zoomToResults(geojson, geocode, mapTarget) {
+async function zoomToResultGraphics() {
     if (!mapView) {
         return;
     }
 
-    const zoomId = ++activeZoomId;
-
     await mapView.when();
-    mapView.resize();
     await waitForResultLayers();
 
-    if (zoomId !== activeZoomId) {
+    const graphics = [];
+    if (resultsLayer && resultsLayer.graphics) {
+        graphics.push(...resultsLayer.graphics.toArray());
+    }
+    if (geocodeLayer && geocodeLayer.graphics) {
+        graphics.push(...geocodeLayer.graphics.toArray());
+    }
+
+    if (!graphics.length) {
+        if (lastGeocode && lastGeocode.location) {
+            await forceViewToLonLat(lastGeocode.location.x, lastGeocode.location.y, 18);
+        }
         return;
     }
 
-    if (mapTarget && (await zoomToGeographicCenter(mapTarget, zoomId))) {
+    try {
+        if (graphics.length === 1) {
+            const geometry = graphics[0].geometry;
+            if (geometry && geometry.type === "point") {
+                await mapView.goTo({ target: geometry, zoom: 18 }, { animate: false, duration: 0 });
+            } else {
+                const extent = geometryExtent(geometry);
+                if (extent) {
+                    await mapView.goTo(extent.expand(1.8), { animate: false, duration: 0 });
+                }
+            }
+            return;
+        }
+
+        let extent = geometryExtent(graphics[0].geometry);
+        for (let i = 1; i < graphics.length; i += 1) {
+            const next = geometryExtent(graphics[i].geometry);
+            if (next) {
+                extent = extent ? extent.union(next) : next;
+            }
+        }
+        if (extent) {
+            await mapView.goTo(extent.expand(1.2), { animate: false, duration: 0 });
+        }
+    } catch (error) {
+        if (error && error.name !== "AbortError") {
+            console.warn("Graphic zoom failed:", error);
+        }
+        if (lastGeocode && lastGeocode.location) {
+            await forceViewToLonLat(lastGeocode.location.x, lastGeocode.location.y, 18);
+        }
+    }
+}
+
+async function forceViewToExtent(extent4326, paddingFactor = 1.4) {
+    if (!extent4326) {
         return;
     }
 
-    if (await zoomToMapTarget(mapTarget, zoomId)) {
+    const span = Math.max(
+        (extent4326.xmax - extent4326.xmin) * paddingFactor,
+        (extent4326.ymax - extent4326.ymin) * paddingFactor,
+    );
+    const centerLon = (extent4326.xmin + extent4326.xmax) / 2;
+    const centerLat = (extent4326.ymin + extent4326.ymax) / 2;
+    await forceViewToLonLat(centerLon, centerLat, zoomLevelForSpan(span));
+}
+
+async function waitForMapFrame() {
+    await new Promise((resolve) => window.requestAnimationFrame(resolve));
+    await new Promise((resolve) => window.requestAnimationFrame(resolve));
+}
+
+async function zoomToDrawnResults(geojson, geocode, mapTarget) {
+    if (!mapView) {
         return;
     }
 
-    const graphics = collectResultGraphics();
-    if (await zoomToGraphics(graphics, zoomId)) {
+    await waitForMapFrame();
+    await zoomToResultGraphics();
+
+    if (mapView.zoom > 14) {
         return;
     }
 
-    const target = computeZoomTarget(geojson, geocode);
-    if (!target) {
-        console.warn("Map zoom skipped: no result geometry to target.");
+    const target = mapTarget || lastMapTarget || _buildMapTargetFromGeojson(geojson);
+    if (geocode && geocode.location) {
+        await forceViewToLonLat(geocode.location.x, geocode.location.y, 18);
         return;
     }
-
-    await zoomToCenterTarget(target, zoomId);
-    if (mapTarget) {
-        await zoomToGeographicCenter(mapTarget, zoomId);
+    if (target && target.extent) {
+        await forceViewToExtent(target.extent, lastDrawFeatures.length > 1 ? 1.25 : 1.5);
     }
+}
+
+async function zoomToResults(geojson, geocode, mapTarget) {
+    await zoomToDrawnResults(geojson, geocode, mapTarget);
 }
 
 function buildMapTargetFromFeature(feature) {
@@ -530,20 +420,37 @@ async function goToInitialExtent(mapView) {
     }
 }
 
-function createMapWithBasemap(Map, MapImageLayer, config) {
-    const map = new Map({ basemap: "gray-vector" });
+async function waitForBasemapLayer() {
+    return waitForBasemap();
+}
 
-    if (config.basemapUrl) {
-        const rowanLayer = new MapImageLayer({
-            url: config.basemapUrl,
-            title: "Rowan County GIS",
-            listMode: "show",
-        });
-        map.add(rowanLayer);
+function createRowanMap(EsriMap, mapViewerLayer, pictometry) {
+    const layers = [pictometry, mapViewerLayer, resultsLayer, geocodeLayer].filter(Boolean);
+    return new EsriMap({
+        basemap: mapViewerLayer ? null : "gray-vector",
+        layers,
+    });
+}
+
+async function createMapImageLayer(MapImageLayer, url, title) {
+    if (!url) {
+        return null;
     }
 
-    map.addMany([resultsLayer, geocodeLayer]);
-    return map;
+    const layer = new MapImageLayer({
+        url,
+        title,
+        listMode: "hide",
+    });
+
+    try {
+        await layer.load();
+    } catch (error) {
+        console.warn(`${title} failed to load:`, error);
+        return null;
+    }
+
+    return layer;
 }
 
 async function initMap() {
@@ -559,9 +466,11 @@ async function initMap() {
     const config = getConfig();
     resultsLayer = null;
     geocodeLayer = null;
+    basemapLayer = null;
+    pictometryLayer = null;
 
     try {
-        const [Map, MapView, GraphicsLayer, MapImageLayer] = await loadModules([
+        const [EsriMap, MapViewClass, GraphicsLayer, MapImageLayer] = await loadModules([
             "esri/Map",
             "esri/views/MapView",
             "esri/layers/GraphicsLayer",
@@ -579,6 +488,17 @@ async function initMap() {
             elevationInfo: { mode: "on-the-ground" },
         });
 
+        basemapLayer = await createMapImageLayer(
+            MapImageLayer,
+            config.basemapUrl,
+            "Rowan County Map",
+        );
+        pictometryLayer = await createMapImageLayer(
+            MapImageLayer,
+            config.pictometryUrl,
+            "Pictometry 2025",
+        );
+
         let map;
 
         if (config.webmapItemId) {
@@ -591,29 +511,37 @@ async function initMap() {
             });
             map = webmap;
             await withTimeout(webmap.load(), 20000, "Web map load");
+            if (pictometryLayer) {
+                webmap.add(pictometryLayer, 0);
+            }
+            if (basemapLayer) {
+                webmap.add(basemapLayer, pictometryLayer ? 1 : 0);
+            }
             webmap.addMany([resultsLayer, geocodeLayer]);
             webmap.reorder(resultsLayer, webmap.layers.length - 1);
             webmap.reorder(geocodeLayer, webmap.layers.length - 1);
         } else {
-            map = createMapWithBasemap(Map, MapImageLayer, config);
+            map = createRowanMap(EsriMap, basemapLayer, pictometryLayer);
         }
 
         map.reorder(resultsLayer, map.layers.length - 1);
         map.reorder(geocodeLayer, map.layers.length - 1);
 
-        mapView = new MapView({
+        mapView = new MapViewClass({
             container: "map-view",
             map,
             center: [-80.4692, 35.6709],
-            zoom: 11,
+            zoom: 10,
             constraints: { snapToZoom: false },
+            popupEnabled: false,
         });
 
         await mapView.when();
-        mapView.resize();
+        if (typeof mapView.goTo !== "function") {
+            throw new Error("MapView did not initialize correctly");
+        }
         setMapStatus("");
         setupMapSelectionHandler();
-        await goToInitialExtent(mapView);
 
         return mapView;
     } catch (error) {
@@ -649,6 +577,15 @@ async function clearResults() {
 function featureKey(feature) {
     const props = (feature && feature.properties) || feature || {};
     return props.PIN || props.PARCEL_ID || "";
+}
+
+function formatOwnerName(props) {
+    const primary = String(props.OWNNAME || "").replace(/&\s*$/, "").trim();
+    const secondary = String(props.OWN2 || "").trim();
+    if (primary && secondary) {
+        return `${primary} & ${secondary}`;
+    }
+    return primary || secondary || "";
 }
 
 function symbolForGeometry(esriGeometry, props, { selected = false, dimmed = false } = {}) {
@@ -721,7 +658,7 @@ async function drawResultFeatures(drawFeatures, selectedKey = "") {
         const selected = Boolean(selectedKey && key && key === selectedKey);
         const dimmed = Boolean(selectedKey && key && key !== selectedKey);
         const symbol = symbolForGeometry(esriGeometry, props, { selected, dimmed });
-        const title = props.OWNNAME || props.Address || props.Whole_Name || props.SUBNAME || "Result";
+        const title = formatOwnerName(props) || props.Address || props.Whole_Name || props.SUBNAME || "Result";
 
         try {
             const graphic = new Graphic({
@@ -743,37 +680,118 @@ async function drawResultFeatures(drawFeatures, selectedKey = "") {
     return added;
 }
 
+let mapClickInFlight = false;
+let mapClickResetTimer = null;
+
+function releaseMapClickLock() {
+    mapClickInFlight = false;
+    if (mapClickResetTimer) {
+        window.clearTimeout(mapClickResetTimer);
+        mapClickResetTimer = null;
+    }
+}
+
+function lockMapClick() {
+    releaseMapClickLock();
+    mapClickInFlight = true;
+    mapClickResetTimer = window.setTimeout(releaseMapClickLock, 45000);
+}
+
+async function resolveMapCoordinates(event) {
+    if (!mapView) {
+        return null;
+    }
+
+    await mapView.when();
+    let mapPoint = event.mapPoint;
+    if (!mapPoint && Number.isFinite(event.x) && Number.isFinite(event.y)) {
+        mapPoint = mapView.toMap({ x: event.x, y: event.y });
+    }
+    if (!mapPoint) {
+        return null;
+    }
+
+    const [projection] = await loadModules(["esri/geometry/projection"]);
+    await projection.load();
+
+    const wgs84 = { wkid: 4326 };
+    let geoPoint = mapPoint;
+    if (!mapPoint.spatialReference || mapPoint.spatialReference.wkid !== 4326) {
+        geoPoint = projection.project(mapPoint, wgs84);
+    }
+    if (!geoPoint) {
+        return null;
+    }
+
+    const longitude = geoPoint.longitude ?? geoPoint.x;
+    const latitude = geoPoint.latitude ?? geoPoint.y;
+    if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) {
+        return null;
+    }
+
+    return { longitude, latitude };
+}
+
+async function handleMapInteraction(event) {
+    if (mapClickInFlight || !mapView) {
+        return;
+    }
+
+    try {
+        if (resultsLayer && lastDrawFeatures.length) {
+            const response = await mapView.hitTest(event, { include: resultsLayer });
+            const hit = response.results.find(
+                (result) => result.graphic && result.graphic.layer === resultsLayer,
+            );
+
+            if (hit && hit.graphic) {
+                const pin = featureKey({ properties: hit.graphic.attributes || {} });
+                const feature = lastDrawFeatures.find((item) => featureKey(item) === pin);
+                if (feature) {
+                    await renderMapSelection(feature);
+                    window.dispatchEvent(new CustomEvent("gis-parcel-selected", { detail: { pin } }));
+                    return;
+                }
+            }
+        }
+
+        const coords = await resolveMapCoordinates(event);
+        if (!coords) {
+            setMapStatus("Could not read map location. Try clicking again.", true);
+            window.setTimeout(() => setMapStatus(""), 2500);
+            return;
+        }
+
+        setMapStatus("Looking up parcel...");
+        lockMapClick();
+        window.dispatchEvent(new CustomEvent("gis-map-parcel-click", {
+            detail: coords,
+        }));
+    } catch (error) {
+        console.warn("Map click failed:", error);
+        setMapStatus("");
+        releaseMapClickLock();
+    }
+}
+
 function setupMapSelectionHandler() {
     if (!mapView || mapClickHandler) {
         return;
     }
 
-    mapClickHandler = mapView.on("click", async (event) => {
-        if (!lastDrawFeatures.length) {
-            return;
-        }
-
-        try {
-            const response = await mapView.hitTest(event);
-            const hit = response.results.find(
-                (result) => result.graphic && result.graphic.layer === resultsLayer,
-            );
-            if (!hit || !hit.graphic) {
-                return;
-            }
-
-            const pin = featureKey({ properties: hit.graphic.attributes || {} });
-            const feature = lastDrawFeatures.find((item) => featureKey(item) === pin);
-            if (!feature) {
-                return;
-            }
-
-            await renderMapSelection(feature);
-            window.dispatchEvent(new CustomEvent("gis-parcel-selected", { detail: { pin } }));
-        } catch (error) {
-            console.warn("Map parcel selection failed:", error);
+    mapClickHandler = mapView.on("click", handleMapInteraction);
+    mapView.on("pointer-down", (event) => {
+        if (event.button === 2) {
+            event.stopPropagation();
+            handleMapInteraction(event);
         }
     });
+
+    if (mapView.container) {
+        mapView.container.addEventListener("contextmenu", (event) => {
+            event.preventDefault();
+        });
+    }
 }
 
 async function renderMapSelection(selectedFeature) {
@@ -784,30 +802,12 @@ async function renderMapSelection(selectedFeature) {
     const selectedKey = featureKey(selectedFeature);
     await drawResultFeatures(lastDrawFeatures, selectedKey);
 
-    const zoomId = ++activeZoomId;
     await mapView.when();
-    mapView.resize();
     await waitForResultLayers();
 
-    if (zoomId !== activeZoomId) {
-        return;
-    }
-
-    const selectedGraphic = resultsLayer.graphics.find(
-        (graphic) => featureKey({ properties: graphic.attributes || {} }) === selectedKey,
-    );
-
     const mapTarget = buildMapTargetFromFeature(selectedFeature) || lastMapTarget;
-
-    if (await zoomToMapTarget(mapTarget, zoomId)) {
-        return;
-    }
-
-    if (selectedGraphic && await zoomToGraphics([selectedGraphic], zoomId)) {
-        return;
-    }
-
-    await zoomToResults(
+    lastDrawFeatures = lastDrawFeatures.length ? lastDrawFeatures : [selectedFeature];
+    await zoomToDrawnResults(
         { type: "FeatureCollection", features: [selectedFeature] },
         lastGeocode,
         mapTarget,
@@ -817,7 +817,7 @@ async function renderMapSelection(selectedFeature) {
 function buildPopupText(props) {
     if (props.PIN || props.PARCEL_ID) {
         const pin = props.PIN || props.PARCEL_ID || "";
-        const owner = props.OWNNAME || "";
+        const owner = formatOwnerName(props);
         const address = props.PROP_ADDRESS || props.TAXADD1 || "";
         const city = props.CITY || "";
         const value = props.TOT_VAL;
@@ -938,43 +938,58 @@ async function showResults(geojson, overlayGeojson, geocode, mapTarget) {
         return;
     }
 
-    await clearResults();
-
-    const features = [
-        ...((geojson && geojson.features) || []),
-        ...((overlayGeojson && overlayGeojson.features) || []),
-    ];
-
-    if (geocode) {
-        try {
-            await showGeocode(geocode);
-        } catch (error) {
-            console.warn("Geocode marker failed:", error);
-        }
-    }
-
-    const drawFeatures = features.filter((feature) => {
-        const props = feature.properties || {};
-        return props._lookup !== "address_point";
-    });
-
-    lastDrawFeatures = drawFeatures;
-    lastGeocode = geocode || null;
-    lastMapTarget = mapTarget || _buildMapTargetFromGeojson(geojson) || null;
-
-    if (drawFeatures.length) {
-        try {
-            await drawResultFeatures(drawFeatures);
-        } catch (error) {
-            console.warn("Result graphics failed:", error);
-        }
-    }
-
     try {
-        mapView.resize();
-        await zoomToResults(geojson, geocode, lastMapTarget);
+        await clearResults();
+
+        const features = [
+            ...((geojson && geojson.features) || []),
+            ...((overlayGeojson && overlayGeojson.features) || []),
+        ];
+
+        if (geocode) {
+            try {
+                await showGeocode(geocode);
+            } catch (error) {
+                console.warn("Geocode marker failed:", error);
+            }
+        }
+
+        const drawFeatures = features.filter((feature) => {
+            const props = feature.properties || {};
+            return props._lookup !== "address_point";
+        });
+
+        lastDrawFeatures = drawFeatures;
+        lastGeocode = geocode || null;
+        lastMapTarget = mapTarget || _buildMapTargetFromGeojson(geojson) || null;
+
+        if (drawFeatures.length) {
+            try {
+                await drawResultFeatures(drawFeatures);
+            } catch (error) {
+                console.warn("Result graphics failed:", error);
+            }
+        }
+
+        await waitForMapFrame();
+        await zoomToDrawnResults(geojson, geocode, lastMapTarget);
+        window.setTimeout(() => {
+            zoomToResultGraphics().catch(() => null);
+        }, 800);
     } catch (error) {
-        console.warn("Map zoom failed:", error);
+        console.warn("showResults failed:", error);
+    }
+}
+
+async function zoomToMapTarget(mapTarget, geocode) {
+    try {
+        await whenReady();
+        if (!mapView) {
+            return;
+        }
+        await zoomToDrawnResults(null, geocode, mapTarget || lastMapTarget);
+    } catch (error) {
+        console.warn("zoomToMapTarget failed:", error);
     }
 }
 
@@ -995,6 +1010,9 @@ window.GisMap = {
     showResults,
     showGeocode,
     zoomToFeature,
+    zoomToMapTarget,
+    clearMapStatus: () => setMapStatus(""),
+    releaseMapClick: releaseMapClickLock,
     getDefaultSuggestions: () => DEFAULT_SUGGESTIONS,
 };
 

@@ -76,6 +76,13 @@ function appendMessage(text, role) {
     container.scrollTop = container.scrollHeight;
 }
 
+const FEATURED_EXAMPLES = [
+    "How many subdivisions are in Rowan County",
+    "Who owns 550 MT HALL RD",
+    "How many parcels on Woodleaf",
+    "PIN 5733-04-51-7482",
+];
+
 function renderSuggestions(examples) {
     const container = document.getElementById("suggestion-buttons");
     container.innerHTML = "";
@@ -109,18 +116,61 @@ function renderResultList(summaries, geojson) {
         const address = summary.PROP_ADDRESS || summary.TAXADD1 || summary.Address || "No address";
         const label = pin || summary.Whole_Name || summary.SUBNAME || "Result";
         button.innerHTML = `<strong>${label}</strong><span>${address}</span>`;
-        button.addEventListener("click", async () => {
-            const pin = summary.PIN || summary.PARCEL_ID;
-            setActiveResultItem(pin);
+        button.addEventListener("click", async (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const selectedPin = summary.PIN || summary.PARCEL_ID;
+            setActiveResultItem(selectedPin);
             const feature = findFeatureForSummary(geojson, summary, index);
             if (!feature) {
                 console.warn("No map feature found for result", summary);
                 return;
             }
-            await window.GisMap.zoomToFeature(feature);
+            if (!window.GisMap) {
+                return;
+            }
+            try {
+                await window.GisMap.whenReady();
+                await window.GisMap.zoomToFeature(feature);
+            } catch (error) {
+                console.error("Result list zoom failed:", error);
+            }
         });
         list.appendChild(button);
     });
+}
+
+async function applyQueryResponse(data, responseOk = true) {
+    const role = responseOk ? "bot" : "error";
+    appendMessage(data.message || "Unexpected response.", role);
+
+    const skipMap = (data.intent && data.intent.intent_type === "list_subdivisions")
+        || !(data.geojson && data.geojson.features && data.geojson.features.length);
+
+    if (!skipMap && data.geojson && window.GisMap) {
+        try {
+            await window.GisMap.whenReady();
+            await window.GisMap.showResults(
+                data.geojson,
+                data.overlay_geojson,
+                data.geocode,
+                data.map_target,
+            );
+            renderResultList(data.summaries || [], data.geojson);
+
+            const pin = (data.summaries && data.summaries[0] && (data.summaries[0].PIN || data.summaries[0].PARCEL_ID)) || "";
+            if (pin) {
+                setActiveResultItem(pin);
+            }
+        } catch (mapError) {
+            console.error("Map update failed:", mapError);
+            appendMessage("Results loaded, but the map could not update.", "error");
+        }
+    }
+
+    if (window.GisMap && window.GisMap.clearMapStatus) {
+        window.GisMap.clearMapStatus();
+    }
 }
 
 async function submitQuery(message) {
@@ -140,25 +190,19 @@ async function submitQuery(message) {
             }),
         });
 
-        const data = await response.json();
-        const role = response.ok ? "bot" : "error";
-        appendMessage(data.message || "Unexpected response.", role);
-
-        if (data.geojson && window.GisMap) {
-            try {
-                await window.GisMap.whenReady();
-                await window.GisMap.showResults(
-                    data.geojson,
-                    data.overlay_geojson,
-                    data.geocode,
-                    data.map_target,
-                );
-                renderResultList(data.summaries || [], data.geojson);
-            } catch (mapError) {
-                console.error("Map update failed:", mapError);
-                appendMessage("Results loaded, but the map could not update.", "error");
-            }
+        let data;
+        try {
+            data = await response.json();
+        } catch (parseError) {
+            appendMessage(
+                `Server error (${response.status}). Restart start-local.bat and try again.`,
+                "error",
+            );
+            console.error(parseError);
+            return;
         }
+
+        await applyQueryResponse(data, response.ok);
     } catch (error) {
         appendMessage("Network error. Please try again.", "error");
         console.error(error);
@@ -167,29 +211,89 @@ async function submitQuery(message) {
     }
 }
 
+async function lookupParcelAtPoint(longitude, latitude) {
+    const config = window.GIS_CHATBOT_CONFIG;
+    if (!config.parcelAtPointUrl) {
+        return;
+    }
+
+    appendMessage("Map parcel lookup", "user");
+    appendMessage("Looking up parcel at that location…", "bot");
+
+    try {
+        const response = await fetch(config.parcelAtPointUrl, {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+                longitude,
+                latitude,
+                session_id: getSessionId(),
+            }),
+        });
+
+        let data;
+        try {
+            data = await response.json();
+        } catch (parseError) {
+            appendMessage(
+                `Server error (${response.status}). Restart start-local.bat and try again.`,
+                "error",
+            );
+            console.error(parseError);
+            return;
+        }
+
+        await applyQueryResponse(data, response.ok);
+    } catch (error) {
+        appendMessage("Network error. Please try again.", "error");
+        console.error(error);
+    } finally {
+        if (window.GisMap && window.GisMap.clearMapStatus) {
+            window.GisMap.clearMapStatus();
+        }
+        if (window.GisMap && window.GisMap.releaseMapClick) {
+            window.GisMap.releaseMapClick();
+        }
+    }
+}
+
 async function loadLayerExamples() {
     const config = window.GIS_CHATBOT_CONFIG;
     try {
         const response = await fetch(config.layersUrl);
         const data = await response.json();
-        const examples = (data.layers || [])
+        const fromLayers = (data.layers || [])
             .flatMap((layer) => layer.examples || [])
             .filter(Boolean);
-        renderSuggestions(examples.length ? examples.slice(0, 4) : window.GisMap.getDefaultSuggestions());
+        const merged = [...FEATURED_EXAMPLES];
+        fromLayers.forEach((example) => {
+            if (!merged.includes(example)) {
+                merged.push(example);
+            }
+        });
+        renderSuggestions(merged.slice(0, 5));
     } catch (error) {
-        renderSuggestions(window.GisMap.getDefaultSuggestions());
+        renderSuggestions(FEATURED_EXAMPLES);
     }
 }
 
 document.addEventListener("DOMContentLoaded", () => {
     appendMessage(
-        "Hello! Ask about a parcel PIN, address, owner, street, or subdivision.",
+        "Hello! Ask about a parcel PIN, address, owner, street, or subdivision — or click a parcel on the map.",
         "bot"
     );
     loadLayerExamples();
 
     window.addEventListener("gis-parcel-selected", (event) => {
         setActiveResultItem(event.detail?.pin || "");
+    });
+
+    window.addEventListener("gis-map-parcel-click", (event) => {
+        const { longitude, latitude } = event.detail || {};
+        if (!Number.isFinite(longitude) || !Number.isFinite(latitude)) {
+            return;
+        }
+        lookupParcelAtPoint(longitude, latitude);
     });
 
     document.getElementById("chat-form").addEventListener("submit", async (event) => {

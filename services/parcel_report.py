@@ -26,7 +26,11 @@ FOCUS_LAYER_ORDER = {
     "parks": ["County Parks"],
     "property_info": [
         "City Limits",
+        "Subdivision",
+        "ETJ",
         "ALL ZONING",
+        "Fire District",
+        "Airport Overlay",
         "Parcel Flood Status",
         "Flood Zone 2014",
         "FEMA Flood Panel",
@@ -127,6 +131,29 @@ def _line_for_layer(layer_name: str, attributes: dict[str, Any]) -> str | None:
         if city_name:
             return f"Location: within {city_name.title()} city limits"
         return "Location: unincorporated Rowan County"
+
+    if layer_name == "Subdivision":
+        name = _clean(attributes.get("SUBNAME") or attributes.get("SubName"))
+        township = _clean(attributes.get("TOWNSHIP") or attributes.get("Twsp"))
+        if name and township:
+            return f"Subdivision: {name.title()} ({township.title()} township)"
+        return f"Subdivision: {name.title()}" if name else None
+
+    if layer_name == "ETJ":
+        municipality = _clean(attributes.get("MUNICIPALITY"))
+        return f"ETJ: {municipality.title()} extraterritorial jurisdiction" if municipality else None
+
+    if layer_name == "Fire District":
+        district = _clean(attributes.get("MAIN_DISTRICT"))
+        cad = _clean(attributes.get("CAD") or attributes.get("DISTRICT_NUM"))
+        if district and cad and cad not in district:
+            return f"Fire district: {district.title()} (CAD {cad})"
+        return f"Fire district: {district.title()}" if district else None
+
+    if layer_name == "Airport Overlay":
+        if attributes.get("in_overlay"):
+            return "Airport overlay: Yes"
+        return None
 
     if layer_name == "ALL ZONING":
         zoning = _clean(attributes.get("ZONING"))
@@ -243,7 +270,7 @@ def summarize_parcel_report(
         skip_fema_panel = False
         for layer_name in order:
             attrs = by_layer.get(layer_name)
-            if layer_name == "City Limits":
+            if layer_name in {"City Limits", "Subdivision", "ETJ"}:
                 line = _line_for_layer(layer_name, attrs or {})
             elif not attrs:
                 continue

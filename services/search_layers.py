@@ -3,21 +3,36 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from typing import Any
 from urllib.parse import urljoin
 
 import requests
 
-from services.arcgis_client import DEFAULT_HEADERS, get_base_url
+from services.arcgis_client import DEFAULT_HEADERS, get_base_url, get_parcel_layer_path
+from services.text_normalize import (
+    fuzzy_best_match,
+    normalize_subdivision_query,
+    subdivision_search_tokens,
+)
 
 SEARCH_ADDRESS_LAYER = "Public/search/MapServer/0"
 SEARCH_STREET_LAYER = "Public/search/MapServer/1"
 SEARCH_SUBDIVISION_LAYER = "Public/search/MapServer/3"
+DEFAULT_APPROVED_SUBDIVISION_LAYER = "Public/IntranetMap/MapServer/27"
 PARCEL_REPORT_SERVICE = "Public/ParcelReport/MapServer"
 DEFAULT_FLOOD_PARCEL_LAYER = "Public/Open_Data_Downloads/MapServer/53"
 DEFAULT_CITY_LIMITS_LAYER = "Public/Open_Data_Downloads/MapServer/41"
+DEFAULT_FIRE_DISTRICT_LAYER = "Public/Public_Safety_Stations_and_Boundaries/MapServer/11"
+DEFAULT_AIRPORT_OVERLAY_LAYER = "Public/AirportOverlay/MapServer/0"
+DEFAULT_ZIP_CODE_LAYER = "Public/RowanZipCodes/MapServer/0"
 PARCEL_FLOOD_STATUS_LAYER = "Parcel Flood Status"
 CITY_LIMITS_LAYER = "City Limits"
+SUBDIVISION_LAYER = "Subdivision"
+ETJ_LAYER = "ETJ"
+FIRE_DISTRICT_LAYER = "Fire District"
+AIRPORT_OVERLAY_LAYER = "Airport Overlay"
+ZIP_CODE_LAYER = "ZIP Code"
 
 PARCEL_REPORT_LAYERS = {
     "parcels": {"id": 0, "name": "Parcels"},
@@ -47,6 +62,7 @@ PARCEL_REPORT_IDENTIFY_NAMES = {
 }
 
 PARCEL_CONTEXT_LAYER_KEYS = [
+    "county_zoning",
     "all_zoning",
     "flood_zone",
     "fema_flood_panel",
@@ -79,15 +95,67 @@ def _street_tokens(value: str) -> list[str]:
 
 
 def _like_tokens(field: str, value: str, *, street_mode: bool = False) -> str:
-    tokens = _street_tokens(value) if street_mode else re.findall(r"[A-Za-z0-9]+", value.upper())
-    if not street_mode:
-        stopwords = {"THE", "SUBDIVISION", "SUB", "NC", "ROWAN", "COUNTY"}
+    tokens = _street_tokens(value) if street_mode else subdivision_search_tokens(value)
+    if street_mode and not tokens:
+        tokens = re.findall(r"[A-Za-z0-9]+", value.upper())
+        stopwords = {"THE", "SUBDIVISION", "SUB", "SUBD", "NC", "ROWAN", "COUNTY"}
         tokens = [token for token in tokens if len(token) >= 2 and token not in stopwords]
     if not tokens:
-        token = value.upper().replace("'", "''")
+        token = normalize_subdivision_query(value).upper().replace("'", "''")
         return f"UPPER({field}) LIKE '%{token}%'"
     clauses = [f"UPPER({field}) LIKE '%{token.replace(chr(39), chr(39)*2)}%'" for token in tokens]
     return " AND ".join(clauses)
+
+
+_subdivision_catalog: list[str] | None = None
+
+
+def _get_subdivision_catalog() -> list[str]:
+    global _subdivision_catalog
+    if _subdivision_catalog is None:
+        payload = list_approved_subdivisions(limit=500)
+        _subdivision_catalog = sorted({
+            (feature.get("properties") or {}).get("SubName", "").strip()
+            for feature in (payload.get("features") or [])
+            if (feature.get("properties") or {}).get("SubName")
+        })
+    return _subdivision_catalog
+
+
+def _query_subdivision_layer(name: str) -> dict[str, Any]:
+    where = _like_tokens("SubName", name)
+    approved = query_layer_raw(
+        get_approved_subdivision_layer_path(),
+        where=where,
+        out_fields="SubName,Twsp,Lots,Acres,PlatBook,PlatPage",
+        result_record_count=5,
+    )
+    if approved.get("features"):
+        return _normalize_subdivision_geojson(approved)
+
+    where = _like_tokens("SUBNAME", name)
+    fallback = query_layer_raw(
+        SEARCH_SUBDIVISION_LAYER,
+        where=where,
+        out_fields="SUBNAME,SUBID,PLATBOOK,PLATPAGE",
+        result_record_count=5,
+    )
+    return _normalize_subdivision_geojson(fallback)
+
+
+def suggest_subdivision_name(subdivision_name: str) -> str | None:
+    normalized = normalize_subdivision_query(subdivision_name)
+    if not normalized:
+        return None
+    return fuzzy_best_match(normalized, _get_subdivision_catalog(), min_ratio=0.72)
+
+
+def canonical_subdivision_name(subdivisions: dict[str, Any], fallback: str) -> str:
+    features = subdivisions.get("features") or []
+    if not features:
+        return normalize_subdivision_query(fallback)
+    properties = features[0].get("properties") or {}
+    return properties.get("SubName") or properties.get("SUBNAME") or normalize_subdivision_query(fallback)
 
 
 def query_layer_raw(
@@ -116,8 +184,9 @@ def query_layer_raw(
         params["geometryType"] = geometry_type or "esriGeometryPolygon"
         params["spatialRel"] = spatial_rel or "esriSpatialRelIntersects"
         params["inSR"] = out_sr
-
-    response = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=30)
+        response = requests.post(url, data=params, headers=DEFAULT_HEADERS, timeout=60)
+    else:
+        response = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=30)
     response.raise_for_status()
     payload = response.json()
     if "error" in payload:
@@ -190,14 +259,53 @@ def count_addresses_on_street(street_name: str, *, limit: int = 500) -> dict[str
     )
 
 
-def search_subdivision(subdivision_name: str) -> dict[str, Any]:
-    where = _like_tokens("SUBNAME", subdivision_name)
-    return query_layer_raw(
-        SEARCH_SUBDIVISION_LAYER,
-        where=where,
-        out_fields="SUBNAME,SUBID,PLATBOOK,PLATPAGE",
-        result_record_count=5,
+def get_approved_subdivision_layer_path() -> str:
+    return os.getenv(
+        "APPROVED_SUBDIVISION_LAYER_URL",
+        DEFAULT_APPROVED_SUBDIVISION_LAYER,
+    ).lstrip("/")
+
+
+def _normalize_subdivision_geojson(payload: dict[str, Any]) -> dict[str, Any]:
+    for feature in payload.get("features") or []:
+        props = feature.setdefault("properties", {})
+        sub_name = props.get("SubName") or props.get("SUBNAME")
+        if sub_name:
+            props["SUBNAME"] = sub_name
+            props["SubName"] = sub_name
+    return payload
+
+
+def list_approved_subdivisions(*, limit: int = 500) -> dict[str, Any]:
+    payload = query_layer_raw(
+        get_approved_subdivision_layer_path(),
+        where="SubName IS NOT NULL",
+        out_fields="SubName,Twsp,Lots",
+        return_geometry=False,
+        result_record_count=limit,
     )
+    return _normalize_subdivision_geojson(payload)
+
+
+def search_subdivision(subdivision_name: str) -> dict[str, Any]:
+    normalized = normalize_subdivision_query(subdivision_name)
+    candidates = [name for name in (normalized, subdivision_name.strip()) if name]
+
+    for candidate in dict.fromkeys(candidates):
+        result = _query_subdivision_layer(candidate)
+        if result.get("features"):
+            return result
+
+    for token in subdivision_search_tokens(normalized or subdivision_name):
+        result = _query_subdivision_layer(token)
+        if result.get("features"):
+            return result
+
+    suggestion = suggest_subdivision_name(normalized or subdivision_name)
+    if suggestion:
+        return _query_subdivision_layer(suggestion)
+
+    return {"type": "FeatureCollection", "features": []}
 
 
 def _polygon_from_geometry(geometry: dict[str, Any]) -> dict[str, Any] | None:
@@ -243,13 +351,20 @@ def parcels_in_subdivision(subdivision_name: str, *, limit: int = 500) -> dict[s
         return {"type": "FeatureCollection", "features": []}
 
     return query_layer_raw(
-        "Public/RowanTaxParcels/MapServer/0",
+        get_parcel_layer_path(),
         where="1=1",
         out_fields="PIN,PARCEL_ID,OWNNAME,PROP_ADDRESS,CITY,TOT_VAL",
         geometry=polygon,
         geometry_type="esriGeometryPolygon",
         result_record_count=limit,
     )
+
+
+def parcels_and_addresses_in_subdivision(subdivision_name: str, *, limit: int = 500) -> dict[str, Any]:
+    parcels = parcels_in_subdivision(subdivision_name, limit=limit)
+    addresses = addresses_in_subdivision(subdivision_name, limit=limit)
+    features = (parcels.get("features") or []) + (addresses.get("features") or [])
+    return {"type": "FeatureCollection", "features": features}
 
 
 def identify_parcel_report_at_point(x: float, y: float, *, layers: str = "all") -> dict[str, Any]:
@@ -287,10 +402,10 @@ def query_parcel_report_by_polygon(
     keys = layer_keys or PARCEL_CONTEXT_LAYER_KEYS
     results: list[dict[str, Any]] = []
 
-    for key in keys:
+    def fetch_layer(key: str) -> list[dict[str, Any]]:
         meta = PARCEL_REPORT_LAYERS.get(key)
         if not meta:
-            continue
+            return []
         layer_path = f"{PARCEL_REPORT_SERVICE}/{meta['id']}"
         layer_name = PARCEL_REPORT_IDENTIFY_NAMES.get(key, meta["name"])
         try:
@@ -303,17 +418,27 @@ def query_parcel_report_by_polygon(
                 result_record_count=25,
             )
         except (requests.RequestException, RuntimeError):
-            continue
+            return []
 
+        layer_results: list[dict[str, Any]] = []
         for feature in payload.get("features") or []:
             properties = feature.get("properties") or {}
-            results.append(
+            layer_results.append(
                 {
                     "layerId": meta["id"],
                     "layerName": layer_name,
                     "attributes": properties,
                 }
             )
+        return layer_results
+
+    with ThreadPoolExecutor(max_workers=6) as executor:
+        futures = {executor.submit(fetch_layer, key): key for key in keys}
+        for future in as_completed(futures):
+            try:
+                results.extend(future.result())
+            except Exception:
+                continue
 
     return {"results": results}
 
@@ -504,4 +629,375 @@ def enrich_parcel_report_flood(
         },
     )
     report["results"] = results
+    return report
+
+
+def get_fire_district_layer_path() -> str:
+    return os.getenv("FIRE_DISTRICT_LAYER_URL", DEFAULT_FIRE_DISTRICT_LAYER).lstrip("/")
+
+
+def get_airport_overlay_layer_path() -> str:
+    return os.getenv("AIRPORT_OVERLAY_LAYER_URL", DEFAULT_AIRPORT_OVERLAY_LAYER).lstrip("/")
+
+
+def get_zip_code_layer_path() -> str:
+    return os.getenv("ZIP_CODE_LAYER_URL", DEFAULT_ZIP_CODE_LAYER).lstrip("/")
+
+
+def _query_polygon_layer(
+    layer_path: str,
+    polygon: dict[str, Any],
+    *,
+    out_fields: str,
+    result_record_count: int = 5,
+) -> list[dict[str, Any]]:
+    url = urljoin(_layer_url(layer_path) + "/", "query")
+    params = {
+        "geometry": json.dumps(polygon),
+        "geometryType": "esriGeometryPolygon",
+        "spatialRel": "esriSpatialRelIntersects",
+        "inSR": 4326,
+        "outFields": out_fields,
+        "returnGeometry": "false",
+        "f": "json",
+        "resultRecordCount": result_record_count,
+    }
+    try:
+        response = requests.get(url, params=params, headers=DEFAULT_HEADERS, timeout=30)
+        response.raise_for_status()
+        payload = response.json()
+    except requests.RequestException:
+        return []
+
+    if payload.get("error"):
+        return []
+    return payload.get("features") or []
+
+
+def _parcel_polygon_from_geojson(geojson: dict[str, Any]) -> dict[str, Any] | None:
+    parcel_features = _parcel_polygon_features(geojson)
+    if len(parcel_features) != 1:
+        return None
+    return _polygon_from_geometry(parcel_features[0].get("geometry") or {})
+
+
+def query_subdivision_for_polygon(polygon: dict[str, Any]) -> dict[str, Any] | None:
+    layer_queries = (
+        (get_approved_subdivision_layer_path(), "SubName,Twsp,Lots,PlatBook,PlatPage"),
+        (SEARCH_SUBDIVISION_LAYER, "SUBNAME,SUBID,PLATBOOK,PLATPAGE"),
+    )
+    for layer_path, out_fields in layer_queries:
+        features = _query_polygon_layer(
+            layer_path,
+            polygon,
+            out_fields=out_fields,
+            result_record_count=3,
+        )
+        for feature in features:
+            attrs = feature.get("attributes") or {}
+            name = str(attrs.get("SubName") or attrs.get("SUBNAME") or "").strip()
+            if not name:
+                continue
+            result = {"SUBNAME": name, "SubName": name}
+            township = attrs.get("Twsp") or attrs.get("TOWNSHIP")
+            if township:
+                result["TOWNSHIP"] = township
+            if attrs.get("SUBID") is not None:
+                result["SUBID"] = attrs.get("SUBID")
+            if attrs.get("Lots") is not None:
+                result["LOTS"] = attrs.get("Lots")
+            return result
+    return None
+
+
+def query_fire_district_for_polygon(polygon: dict[str, Any]) -> dict[str, Any] | None:
+    features = _query_polygon_layer(
+        get_fire_district_layer_path(),
+        polygon,
+        out_fields="MAIN_DISTRICT,CAD,DISTRICT_NUM",
+        result_record_count=3,
+    )
+    if not features:
+        return None
+
+    attrs = features[0].get("attributes") or {}
+    district = str(attrs.get("MAIN_DISTRICT") or "").strip()
+    if not district:
+        return None
+    return {
+        "MAIN_DISTRICT": district,
+        "CAD": attrs.get("CAD"),
+        "DISTRICT_NUM": attrs.get("DISTRICT_NUM"),
+    }
+
+
+def query_airport_overlay_for_polygon(polygon: dict[str, Any]) -> bool:
+    features = _query_polygon_layer(
+        get_airport_overlay_layer_path(),
+        polygon,
+        out_fields="OBJECTID",
+        result_record_count=1,
+    )
+    return bool(features)
+
+
+def query_zip_code_for_polygon(polygon: dict[str, Any]) -> str | None:
+    features = _query_polygon_layer(
+        get_zip_code_layer_path(),
+        polygon,
+        out_fields="ZIP_CODE,COMMUNITY",
+        result_record_count=1,
+    )
+    if not features:
+        return None
+    zip_code = (features[0].get("attributes") or {}).get("ZIP_CODE")
+    if zip_code is None:
+        return None
+    text = str(zip_code).strip()
+    return text or None
+
+
+def query_county_zoning_for_polygon(polygon: dict[str, Any]) -> dict[str, Any] | None:
+    layer_path = f"{PARCEL_REPORT_SERVICE}/1"
+    features = _query_polygon_layer(layer_path, polygon, out_fields="ZONING", result_record_count=5)
+    if not features:
+        return None
+
+    attrs = features[0].get("attributes") or {}
+    zoning = str(attrs.get("ZONING") or "").strip()
+    if not zoning:
+        return None
+    return {"ZONING": zoning}
+
+
+def _upsert_report_layer(
+    parcel_report: dict[str, Any] | None,
+    *,
+    layer_name: str,
+    attributes: dict[str, Any],
+    insert_at: int = 0,
+) -> dict[str, Any]:
+    report = dict(parcel_report or {"results": []})
+    results = [item for item in (report.get("results") or []) if item.get("layerName") != layer_name]
+    results.insert(insert_at, {"layerName": layer_name, "attributes": attributes})
+    report["results"] = results
+    return report
+
+
+def enrich_parcel_report_subdivision(
+    parcel_report: dict[str, Any] | None,
+    geojson: dict[str, Any],
+) -> dict[str, Any] | None:
+    polygon = _parcel_polygon_from_geojson(geojson)
+    if not polygon:
+        return parcel_report
+
+    subdivision = query_subdivision_for_polygon(polygon)
+    if not subdivision:
+        return parcel_report
+
+    return _upsert_report_layer(
+        parcel_report,
+        layer_name=SUBDIVISION_LAYER,
+        attributes=subdivision,
+        insert_at=1,
+    )
+
+
+def enrich_parcel_report_etj(
+    parcel_report: dict[str, Any] | None,
+    geojson: dict[str, Any],
+) -> dict[str, Any] | None:
+    from services.parcel_facts import municipality_from_county_zoning
+
+    polygon = _parcel_polygon_from_geojson(geojson)
+    if not polygon:
+        return parcel_report
+
+    county_zoning = query_county_zoning_for_polygon(polygon)
+    municipality = municipality_from_county_zoning(
+        (county_zoning or {}).get("ZONING") if county_zoning else None
+    )
+    if not municipality:
+        return parcel_report
+
+    in_city_limits = False
+    for item in (parcel_report or {}).get("results") or []:
+        if item.get("layerName") != CITY_LIMITS_LAYER:
+            continue
+        city_name = (item.get("attributes") or {}).get("CITY_NAME")
+        if city_name:
+            in_city_limits = True
+            break
+
+    if in_city_limits:
+        return parcel_report
+
+    return _upsert_report_layer(
+        parcel_report,
+        layer_name=ETJ_LAYER,
+        attributes={"MUNICIPALITY": municipality},
+        insert_at=2,
+    )
+
+
+def enrich_parcel_report_fire_district(
+    parcel_report: dict[str, Any] | None,
+    geojson: dict[str, Any],
+) -> dict[str, Any] | None:
+    polygon = _parcel_polygon_from_geojson(geojson)
+    if not polygon:
+        return parcel_report
+
+    fire = query_fire_district_for_polygon(polygon)
+    if not fire:
+        return parcel_report
+
+    return _upsert_report_layer(
+        parcel_report,
+        layer_name=FIRE_DISTRICT_LAYER,
+        attributes=fire,
+    )
+
+
+def enrich_parcel_report_airport_overlay(
+    parcel_report: dict[str, Any] | None,
+    geojson: dict[str, Any],
+) -> dict[str, Any] | None:
+    polygon = _parcel_polygon_from_geojson(geojson)
+    if not polygon:
+        return parcel_report
+
+    if not query_airport_overlay_for_polygon(polygon):
+        return parcel_report
+
+    return _upsert_report_layer(
+        parcel_report,
+        layer_name=AIRPORT_OVERLAY_LAYER,
+        attributes={"in_overlay": True},
+    )
+
+
+def enrich_parcel_report_zip_code(
+    parcel_report: dict[str, Any] | None,
+    geojson: dict[str, Any],
+) -> dict[str, Any] | None:
+    parcel_features = _parcel_polygon_features(geojson)
+    if len(parcel_features) == 1:
+        props = parcel_features[0].get("properties") or {}
+        if str(props.get("ZIPCODE") or "").strip():
+            return parcel_report
+
+    polygon = _parcel_polygon_from_geojson(geojson)
+    if not polygon:
+        return parcel_report
+
+    zip_code = query_zip_code_for_polygon(polygon)
+    if not zip_code:
+        return parcel_report
+
+    return _upsert_report_layer(
+        parcel_report,
+        layer_name=ZIP_CODE_LAYER,
+        attributes={"ZIP_CODE": zip_code},
+    )
+
+
+def enrich_parcel_report_context(
+    parcel_report: dict[str, Any] | None,
+    geojson: dict[str, Any],
+) -> dict[str, Any] | None:
+    """Apply supplemental parcel context enrichers (GIS calls run in parallel)."""
+    from services.parcel_address_lookup import _feature_centroid
+    from services.parcel_facts import municipality_from_county_zoning
+
+    parcel_features = _parcel_polygon_features(geojson)
+    if len(parcel_features) != 1:
+        return parcel_report
+
+    feature = parcel_features[0]
+    props = feature.get("properties") or {}
+    parcel_id = str(props.get("PARCEL_ID") or "").strip()
+    polygon = _polygon_from_geometry(feature.get("geometry") or {})
+    centroid = _feature_centroid(feature)
+
+    futures: dict[str, Any] = {}
+    with ThreadPoolExecutor(max_workers=8) as executor:
+        if parcel_id:
+            futures["flood"] = executor.submit(query_parcel_flood_status, parcel_id)
+        if centroid:
+            futures["city"] = executor.submit(query_city_limits_at_point, centroid[0], centroid[1])
+        if polygon:
+            futures["subdivision"] = executor.submit(query_subdivision_for_polygon, polygon)
+            futures["fire"] = executor.submit(query_fire_district_for_polygon, polygon)
+            futures["airport"] = executor.submit(query_airport_overlay_for_polygon, polygon)
+            futures["county_zoning"] = executor.submit(query_county_zoning_for_polygon, polygon)
+            if not str(props.get("ZIPCODE") or "").strip():
+                futures["zip"] = executor.submit(query_zip_code_for_polygon, polygon)
+
+        results = {name: future.result() for name, future in futures.items()}
+
+    report = dict(parcel_report or {"results": []})
+
+    flood = results.get("flood")
+    if flood:
+        report = _upsert_report_layer(
+            report,
+            layer_name=PARCEL_FLOOD_STATUS_LAYER,
+            attributes=flood,
+            insert_at=0,
+        )
+
+    report = _upsert_report_layer(
+        report,
+        layer_name=CITY_LIMITS_LAYER,
+        attributes={"CITY_NAME": results.get("city")},
+        insert_at=0,
+    )
+
+    subdivision = results.get("subdivision")
+    if subdivision:
+        report = _upsert_report_layer(
+            report,
+            layer_name=SUBDIVISION_LAYER,
+            attributes=subdivision,
+            insert_at=1,
+        )
+
+    county_zoning = results.get("county_zoning")
+    municipality = municipality_from_county_zoning(
+        (county_zoning or {}).get("ZONING") if county_zoning else None
+    )
+    in_city_limits = bool(results.get("city"))
+    if municipality and not in_city_limits:
+        report = _upsert_report_layer(
+            report,
+            layer_name=ETJ_LAYER,
+            attributes={"MUNICIPALITY": municipality},
+            insert_at=2,
+        )
+
+    fire = results.get("fire")
+    if fire:
+        report = _upsert_report_layer(
+            report,
+            layer_name=FIRE_DISTRICT_LAYER,
+            attributes=fire,
+        )
+
+    if results.get("airport"):
+        report = _upsert_report_layer(
+            report,
+            layer_name=AIRPORT_OVERLAY_LAYER,
+            attributes={"in_overlay": True},
+        )
+
+    zip_code = results.get("zip")
+    if zip_code:
+        report = _upsert_report_layer(
+            report,
+            layer_name=ZIP_CODE_LAYER,
+            attributes={"ZIP_CODE": zip_code},
+        )
+
     return report

@@ -13,7 +13,7 @@
             <div>
                 <p class="eyebrow">Rowan County, NC</p>
                 <h1>GIS Assistant</h1>
-                <p class="subtitle">Ask about parcels, addresses, owners, streets, and subdivisions.</p>
+                <p class="subtitle">Ask about parcels, addresses, owners, streets, and subdivisions — or click a parcel on the map.</p>
             </div>
             <a class="admin-link" href="{{ url_for('admin_queries') }}">Staff log</a>
         </header>
@@ -53,15 +53,17 @@
 
     <script>
         window.GIS_CHATBOT_CONFIG = {
-            basemapUrl: {{ basemap_url | tojson }},
+            basemapUrl: {{ basemap_url | default('https://gis.rowancountync.gov/arcgis/rest/services/Public/MapViewer/MapServer', true) | tojson }},
+            pictometryUrl: {{ pictometry_url | default('https://gis.rowancountync.gov/arcgis/rest/services/Pictometry/Pictometry2025/MapServer', true) | tojson }},
             webmapItemId: {{ webmap_item_id | tojson }},
             portalUrl: {{ portal_url | tojson }},
             queryUrl: {{ url_for('api_query') | tojson }},
+            parcelAtPointUrl: {{ url_for('api_parcel_at_point') | tojson }},
             layersUrl: {{ url_for('api_layers') | tojson }}
         };
     </script>
     <script src="https://js.arcgis.com/4.29/"></script>
-    <script src="{{ url_for('static', filename='js/map.js') }}?v=22"></script>
-    <script src="{{ url_for('static', filename='js/chat.js') }}?v=20"></script>
+    <script src="{{ url_for('static', filename='js/map.js') }}?v=46"></script>
+    <script src="{{ url_for('static', filename='js/chat.js') }}?v=29"></script>
 </body>
 </html>
