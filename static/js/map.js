@@ -1014,6 +1014,11 @@ window.GisMap = {
     clearMapStatus: () => setMapStatus(""),
     releaseMapClick: releaseMapClickLock,
     getDefaultSuggestions: () => DEFAULT_SUGGESTIONS,
+    setPictometryVisible(visible) {
+        if (pictometryLayer) {
+            pictometryLayer.visible = Boolean(visible);
+        }
+    },
 };
 
 document.addEventListener("DOMContentLoaded", () => {

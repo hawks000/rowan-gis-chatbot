@@ -34,6 +34,8 @@ services:
       - ARCGIS_PICTOMETRY_URL=${ARCGIS_PICTOMETRY_URL:-https://gis.rowancountync.gov/arcgis/rest/services/Pictometry/Pictometry2025/MapServer}
       - PARCEL_LAYER_URL=${PARCEL_LAYER_URL:-Public/RowanTaxParcels/MapServer/0}
       - CHAT_DB_PATH=${CHAT_DB_PATH:-/app/data/chatbot.db}
+      - QUERY_RATE_LIMIT=${QUERY_RATE_LIMIT:-30}
+      - QUERY_RATE_WINDOW_SECONDS=${QUERY_RATE_WINDOW_SECONDS:-60}
       - AZURE_OPENAI_ENDPOINT=${AZURE_OPENAI_ENDPOINT:-}
       - AZURE_OPENAI_KEY=${AZURE_OPENAI_KEY:-}
     volumes:

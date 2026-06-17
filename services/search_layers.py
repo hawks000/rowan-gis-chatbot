@@ -110,7 +110,7 @@ def _like_tokens(field: str, value: str, *, street_mode: bool = False) -> str:
 _subdivision_catalog: list[str] | None = None
 
 
-def _get_subdivision_catalog() -> list[str]:
+def get_subdivision_catalog() -> list[str]:
     global _subdivision_catalog
     if _subdivision_catalog is None:
         payload = list_approved_subdivisions(limit=500)
@@ -147,7 +147,7 @@ def suggest_subdivision_name(subdivision_name: str) -> str | None:
     normalized = normalize_subdivision_query(subdivision_name)
     if not normalized:
         return None
-    return fuzzy_best_match(normalized, _get_subdivision_catalog(), min_ratio=0.72)
+    return fuzzy_best_match(normalized, get_subdivision_catalog(), min_ratio=0.72)
 
 
 def canonical_subdivision_name(subdivisions: dict[str, Any], fallback: str) -> str:

@@ -8,6 +8,14 @@ function getSessionId() {
     return sessionId;
 }
 
+const RECENT_KEY = "gis-chatbot-recent";
+const FEATURED_EXAMPLES = [
+    "How many subdivisions are in Rowan County",
+    "Who owns 550 MT HALL RD",
+    "How many parcels on Woodleaf",
+    "PIN 5733-04-51-7482",
+];
+
 function escapeHtml(text) {
     return text
         .replace(/&/g, "&amp;")
@@ -74,14 +82,67 @@ function appendMessage(text, role) {
     }
     container.appendChild(bubble);
     container.scrollTop = container.scrollHeight;
+    return bubble;
 }
 
-const FEATURED_EXAMPLES = [
-    "How many subdivisions are in Rowan County",
-    "Who owns 550 MT HALL RD",
-    "How many parcels on Woodleaf",
-    "PIN 5733-04-51-7482",
-];
+function appendPropertyCard(card) {
+    if (!card || !card.pin) {
+        return;
+    }
+
+    const container = document.getElementById("chat-messages");
+    const wrapper = document.createElement("div");
+    wrapper.className = "property-card";
+
+    const factsHtml = (card.facts || [])
+        .map((item) => `<dt>${escapeHtml(item.label)}</dt><dd>${escapeHtml(item.value)}</dd>`)
+        .join("");
+    const contextHtml = (card.context || [])
+        .map((item) => `<dt>${escapeHtml(item.label)}</dt><dd>${escapeHtml(item.value)}</dd>`)
+        .join("");
+
+    wrapper.innerHTML = `
+        <div class="property-card-header">
+            <strong>${escapeHtml(card.pin)}</strong>
+            <span>${escapeHtml(card.address || "No address on file")}</span>
+        </div>
+        <p class="property-card-owner">${escapeHtml(card.owner || "Unknown owner")}</p>
+        ${factsHtml ? `<dl class="property-card-grid">${factsHtml}</dl>` : ""}
+        ${contextHtml ? `<dl class="property-card-grid property-card-context">${contextHtml}</dl>` : ""}
+    `;
+    container.appendChild(wrapper);
+    container.scrollTop = container.scrollHeight;
+}
+
+function appendSuggestionChips(suggestions) {
+    if (!suggestions || !suggestions.length) {
+        return;
+    }
+
+    const container = document.getElementById("chat-messages");
+    const row = document.createElement("div");
+    row.className = "suggestion-chips";
+
+    const label = document.createElement("span");
+    label.className = "suggestion-chips-label";
+    label.textContent = "Did you mean:";
+    row.appendChild(label);
+
+    suggestions.forEach((item) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "chip-button";
+        button.textContent = item.label || item.query;
+        button.title = item.query;
+        button.addEventListener("click", () => {
+            submitQuery(item.query);
+        });
+        row.appendChild(button);
+    });
+
+    container.appendChild(row);
+    container.scrollTop = container.scrollHeight;
+}
 
 function renderSuggestions(examples) {
     const container = document.getElementById("suggestion-buttons");
@@ -91,11 +152,53 @@ function renderSuggestions(examples) {
         button.type = "button";
         button.textContent = example;
         button.addEventListener("click", () => {
-            document.getElementById("chat-input").value = example;
-            document.getElementById("chat-form").requestSubmit();
+            submitQuery(example);
         });
         container.appendChild(button);
     });
+}
+
+function saveRecentSearch(query) {
+    const trimmed = query.trim();
+    if (!trimmed) {
+        return;
+    }
+    const recent = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
+    const updated = [trimmed, ...recent.filter((item) => item !== trimmed)].slice(0, 8);
+    localStorage.setItem(RECENT_KEY, JSON.stringify(updated));
+    renderRecentSearches();
+}
+
+function renderRecentSearches() {
+    const recent = JSON.parse(localStorage.getItem(RECENT_KEY) || "[]");
+    const section = document.getElementById("recent-searches");
+    const container = document.getElementById("recent-buttons");
+    if (!recent.length) {
+        section.classList.add("hidden");
+        return;
+    }
+
+    section.classList.remove("hidden");
+    container.innerHTML = "";
+    recent.forEach((example) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = example;
+        button.addEventListener("click", () => {
+            submitQuery(example);
+        });
+        container.appendChild(button);
+    });
+}
+
+function updateShareUrl(query) {
+    const url = new URL(window.location.href);
+    url.searchParams.set("q", query);
+    window.history.replaceState({}, "", url);
+}
+
+function readInitialQuery() {
+    return new URLSearchParams(window.location.search).get("q");
 }
 
 function renderResultList(summaries, geojson) {
@@ -122,11 +225,7 @@ function renderResultList(summaries, geojson) {
             const selectedPin = summary.PIN || summary.PARCEL_ID;
             setActiveResultItem(selectedPin);
             const feature = findFeatureForSummary(geojson, summary, index);
-            if (!feature) {
-                console.warn("No map feature found for result", summary);
-                return;
-            }
-            if (!window.GisMap) {
+            if (!feature || !window.GisMap) {
                 return;
             }
             try {
@@ -143,6 +242,13 @@ function renderResultList(summaries, geojson) {
 async function applyQueryResponse(data, responseOk = true) {
     const role = responseOk ? "bot" : "error";
     appendMessage(data.message || "Unexpected response.", role);
+
+    if (data.property_card) {
+        appendPropertyCard(data.property_card);
+    }
+    if (data.suggestions && data.suggestions.length) {
+        appendSuggestionChips(data.suggestions);
+    }
 
     const skipMap = (data.intent && data.intent.intent_type === "list_subdivisions")
         || !(data.geojson && data.geojson.features && data.geojson.features.length);
@@ -179,6 +285,8 @@ async function submitQuery(message) {
     submitButton.disabled = true;
 
     appendMessage(message, "user");
+    saveRecentSearch(message);
+    updateShareUrl(message);
 
     try {
         const response = await fetch(config.queryUrl, {
@@ -199,6 +307,11 @@ async function submitQuery(message) {
                 "error",
             );
             console.error(parseError);
+            return;
+        }
+
+        if (response.status === 429) {
+            await applyQueryResponse(data, false);
             return;
         }
 
@@ -263,18 +376,73 @@ async function loadLayerExamples() {
         const response = await fetch(config.layersUrl);
         const data = await response.json();
         const fromLayers = (data.layers || [])
-            .flatMap((layer) => layer.examples || [])
+            .flatMap((layer) => (layer.examples || []).slice(0, 1))
             .filter(Boolean);
         const merged = [...FEATURED_EXAMPLES];
         fromLayers.forEach((example) => {
-            if (!merged.includes(example)) {
+            if (!merged.some((item) => item.toLowerCase() === example.toLowerCase())) {
                 merged.push(example);
             }
         });
-        renderSuggestions(merged.slice(0, 5));
+        renderSuggestions(merged.slice(0, 6));
     } catch (error) {
         renderSuggestions(FEATURED_EXAMPLES);
     }
+}
+
+let autocompleteTimer = null;
+let cachedSubdivisions = null;
+
+async function loadSubdivisionsCache() {
+    if (cachedSubdivisions) {
+        return cachedSubdivisions;
+    }
+    const config = window.GIS_CHATBOT_CONFIG;
+    try {
+        const response = await fetch(config.subdivisionsUrl);
+        const data = await response.json();
+        cachedSubdivisions = data.names || [];
+    } catch (error) {
+        cachedSubdivisions = [];
+    }
+    return cachedSubdivisions;
+}
+
+async function updateAutocompleteOptions(value) {
+    const datalist = document.getElementById("search-suggestions");
+    const needle = value.trim();
+    if (needle.length < 2) {
+        datalist.innerHTML = "";
+        return;
+    }
+
+    const options = new Set();
+    const subdivisions = await loadSubdivisionsCache();
+    subdivisions
+        .filter((name) => name.toUpperCase().includes(needle.toUpperCase()))
+        .slice(0, 8)
+        .forEach((name) => options.add(`how many parcels in ${name}`));
+
+    try {
+        const config = window.GIS_CHATBOT_CONFIG;
+        const response = await fetch(`${config.autocompleteUrl}?q=${encodeURIComponent(needle)}`);
+        const data = await response.json();
+        (data.streets || []).slice(0, 5).forEach((street) => {
+            options.add(`How many parcels on ${street}`);
+        });
+        (data.subdivisions || []).slice(0, 5).forEach((name) => {
+            options.add(`how many parcels in ${name}`);
+        });
+    } catch (error) {
+        console.warn("Autocomplete failed:", error);
+    }
+
+    datalist.innerHTML = "";
+    [...options].slice(0, 10).forEach((option) => {
+        const node = document.createElement("option");
+        node.value = option;
+        datalist.appendChild(node);
+    });
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -283,6 +451,34 @@ document.addEventListener("DOMContentLoaded", () => {
         "bot"
     );
     loadLayerExamples();
+    renderRecentSearches();
+    loadSubdivisionsCache();
+
+    const input = document.getElementById("chat-input");
+    input.addEventListener("input", () => {
+        window.clearTimeout(autocompleteTimer);
+        autocompleteTimer = window.setTimeout(() => {
+            updateAutocompleteOptions(input.value);
+        }, 250);
+    });
+
+    document.addEventListener("keydown", (event) => {
+        if (event.key === "/" && document.activeElement !== input) {
+            event.preventDefault();
+            input.focus();
+        }
+    });
+
+    const pictometryToggle = document.getElementById("toggle-pictometry");
+    if (pictometryToggle) {
+        pictometryToggle.addEventListener("change", async () => {
+            if (!window.GisMap) {
+                return;
+            }
+            await window.GisMap.whenReady();
+            window.GisMap.setPictometryVisible(pictometryToggle.checked);
+        });
+    }
 
     window.addEventListener("gis-parcel-selected", (event) => {
         setActiveResultItem(event.detail?.pin || "");
@@ -298,7 +494,6 @@ document.addEventListener("DOMContentLoaded", () => {
 
     document.getElementById("chat-form").addEventListener("submit", async (event) => {
         event.preventDefault();
-        const input = document.getElementById("chat-input");
         const message = input.value.trim();
         if (!message) {
             return;
@@ -306,4 +501,10 @@ document.addEventListener("DOMContentLoaded", () => {
         input.value = "";
         await submitQuery(message);
     });
+
+    const initialQuery = readInitialQuery();
+    if (initialQuery) {
+        input.value = initialQuery;
+        submitQuery(initialQuery);
+    }
 });

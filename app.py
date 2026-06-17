@@ -44,11 +44,13 @@ from services.parcel_report import format_property_details
 from services.rod_links import format_deed_record_line, format_plat_record_line
 from services.query_parser import QueryIntent, build_where_clause, parse_query, retry_intent_from_message
 from services.text_normalize import fuzzy_score, parse_address_parts, parse_city_from_query
+from services.rate_limit import is_rate_limited
 from services.search_layers import (
     addresses_in_subdivision,
     canonical_subdivision_name,
     count_addresses_on_street,
     enrich_parcel_report_context,
+    get_subdivision_catalog,
     identify_parcel_report_at_point,
     list_approved_subdivisions,
     parcels_in_subdivision,
@@ -427,6 +429,74 @@ def _narrow_parcel_results(
     return geojson
 
 
+def _client_ip() -> str:
+    forwarded = (request.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+    return forwarded or (request.remote_addr or "unknown")
+
+
+def _rate_limit_or_response(session_id: str):
+    limited, retry_after = is_rate_limited(_client_ip(), session_id or "anonymous")
+    if not limited:
+        return None
+    return jsonify(
+        {
+            "status": "rate_limited",
+            "message": f"Too many requests. Please wait {retry_after} seconds and try again.",
+            "retry_after": retry_after,
+        }
+    ), 429
+
+
+def _split_fact_line(line: str) -> tuple[str, str]:
+    if ":" in line:
+        label, value = line.split(":", 1)
+        return label.strip(), value.strip()
+    return "Info", line.strip()
+
+
+def _build_property_card(summary: dict | None, parcel_report: dict | None = None) -> dict | None:
+    if not summary:
+        return None
+    pin = summary.get("PIN") or summary.get("PARCEL_ID")
+    if not pin:
+        return None
+
+    facts = [_split_fact_line(line) for line in format_parcel_attribute_lines(summary)]
+    facts = [{"label": label, "value": value} for label, value in facts if value]
+
+    context = []
+    if parcel_report:
+        for line in format_property_details(parcel_report, parcel_pin=str(pin)):
+            label, value = _split_fact_line(line)
+            if value:
+                context.append({"label": label, "value": value})
+
+    return {
+        "pin": str(pin),
+        "owner": combined_owner_name(summary),
+        "address": summary.get("PROP_ADDRESS") or summary.get("TAXADD1") or summary.get("Address") or "",
+        "facts": facts,
+        "context": context[:10],
+    }
+
+
+def _build_query_suggestions(intent: QueryIntent, result_count: int) -> list[dict[str, str]]:
+    if result_count > 0:
+        return []
+
+    suggestions: list[dict[str, str]] = []
+    if intent.intent_type.startswith("subdivision"):
+        suggestion = suggest_subdivision_name(intent.value)
+        if suggestion and suggestion.upper() != intent.value.upper():
+            suggestions.append(
+                {
+                    "label": suggestion,
+                    "query": f"how many parcels in {suggestion}",
+                }
+            )
+    return suggestions
+
+
 def _format_summary_message(intent, summaries, result_count, geocode=None, parcel_report=None):
     source_label = _geocode_source_label(geocode)
 
@@ -505,13 +575,8 @@ def _format_summary_message(intent, summaries, result_count, geocode=None, parce
     if intent.intent_type == "subdivision_addresses":
         sub = intent.value
         if result_count == 0:
-            suggestion = suggest_subdivision_name(sub)
-            if suggestion and suggestion.upper() != sub.upper():
-                return (
-                    f'No addresses found for "{sub}". '
-                    f'Did you mean subdivision **{suggestion}**? '
-                    f'Try: how many addresses in {suggestion}'
-                )
+            if suggest_subdivision_name(sub):
+                return f'No addresses found for "{sub}".'
             return f'No subdivision matching "{sub}" was found.'
         label = "address" if result_count == 1 else "addresses"
         return f"Found {result_count} {label} in subdivision {sub}."
@@ -519,12 +584,8 @@ def _format_summary_message(intent, summaries, result_count, geocode=None, parce
     if intent.intent_type == "subdivision_both":
         sub = intent.value
         if result_count == 0:
-            suggestion = suggest_subdivision_name(sub)
-            if suggestion and suggestion.upper() != sub.upper():
-                return (
-                    f'No results for "{sub}". '
-                    f'Did you mean subdivision **{suggestion}**?'
-                )
+            if suggest_subdivision_name(sub):
+                return f'No results for "{sub}".'
             return f'No subdivision matching "{sub}" was found.'
         return (
             f"Found {result_count} parcels and/or addresses in subdivision {sub}. "
@@ -534,13 +595,8 @@ def _format_summary_message(intent, summaries, result_count, geocode=None, parce
     if intent.intent_type == "subdivision_parcels":
         sub = intent.value
         if result_count == 0:
-            suggestion = suggest_subdivision_name(sub)
-            if suggestion and suggestion.upper() != sub.upper():
-                return (
-                    f'No parcels found for "{sub}". '
-                    f'Did you mean subdivision **{suggestion}**? '
-                    f'Try: how many parcels in {suggestion}'
-                )
+            if suggest_subdivision_name(sub):
+                return f'No parcels found for "{sub}".'
             return f'No subdivision matching "{sub}" was found.'
         if result_count == 1:
             row = summaries[0]
@@ -806,6 +862,9 @@ def _build_api_response(
         message = "No tax parcel was found at that map location. Try clicking closer to a parcel boundary."
 
     map_target = _build_map_target(map_geojson, geocode) if result_count else None
+    property_card = None
+    if result_count == 1 and summaries:
+        property_card = _build_property_card(summaries[0], parcel_report)
     payload = {
         "status": status,
         "message": message,
@@ -817,6 +876,8 @@ def _build_api_response(
         "geocode": geocode,
         "parcel_report": parcel_report,
         "map_target": map_target,
+        "suggestions": _build_query_suggestions(intent, result_count),
+        "property_card": property_card,
     }
     http_status = 200 if result_count else 404
     return payload, http_status
@@ -942,7 +1003,7 @@ def health():
     return jsonify({
         "status": "healthy",
         "app": "rowan-gis-chatbot",
-        "build": "2026.06.17-parser47",
+        "build": "2026.06.17-ux48",
     })
 
 
@@ -952,6 +1013,43 @@ def api_layers():
     return jsonify({"layers": get_layer_catalog()})
 
 
+@app.route("/api/subdivisions")
+def api_subdivisions():
+    """Return approved subdivision names for client-side autocomplete."""
+    try:
+        return jsonify({"names": get_subdivision_catalog()})
+    except requests.RequestException as exc:
+        logger.warning("Subdivision catalog failed: %s", exc)
+        return jsonify({"names": []})
+
+
+@app.route("/api/autocomplete")
+def api_autocomplete():
+    """Suggest subdivisions and streets matching partial input."""
+    query = (request.args.get("q") or "").strip()
+    if len(query) < 2:
+        return jsonify({"subdivisions": [], "streets": []})
+
+    needle = query.upper()
+    subdivisions = [
+        name for name in get_subdivision_catalog()
+        if needle in name.upper()
+    ][:8]
+
+    streets: list[str] = []
+    try:
+        street_payload = search_street_centerlines(query, limit=8)
+        for feature in street_payload.get("features") or []:
+            props = feature.get("properties") or {}
+            label = props.get("Whole_Name") or props.get("ROAD_NAME")
+            if label and label not in streets:
+                streets.append(str(label))
+    except requests.RequestException as exc:
+        logger.warning("Street autocomplete failed: %s", exc)
+
+    return jsonify({"subdivisions": subdivisions, "streets": streets[:8]})
+
+
 @app.route("/api/query", methods=["POST"])
 def api_query():
     """Parse user message, query ArcGIS REST, log interaction."""
@@ -959,6 +1057,10 @@ def api_query():
     payload = request.get_json(silent=True) or {}
     message = (payload.get("message") or "").strip()
     session_id = (payload.get("session_id") or "anonymous").strip()[:64]
+
+    rate_response = _rate_limit_or_response(session_id)
+    if rate_response:
+        return rate_response
 
     if not message:
         return jsonify({"error": "Message is required."}), 400
@@ -1028,6 +1130,10 @@ def api_query():
         summary_message = _format_summary_message(
             intent, summaries, result_count, geocode, parcel_report
         )
+        suggestions = _build_query_suggestions(intent, result_count)
+        property_card = None
+        if result_count == 1 and summaries:
+            property_card = _build_property_card(summaries[0], parcel_report)
         map_target = _build_map_target(map_geojson, geocode) if result_count else None
         return jsonify(
             {
@@ -1041,6 +1147,8 @@ def api_query():
                 "geocode": geocode,
                 "parcel_report": parcel_report,
                 "map_target": map_target,
+                "suggestions": suggestions,
+                "property_card": property_card,
             }
         )
 
@@ -1072,6 +1180,10 @@ def api_parcel_at_point():
     started = time.perf_counter()
     payload = request.get_json(silent=True) or {}
     session_id = (payload.get("session_id") or "anonymous").strip()[:64]
+
+    rate_response = _rate_limit_or_response(session_id)
+    if rate_response:
+        return rate_response
 
     try:
         longitude = float(payload.get("longitude"))

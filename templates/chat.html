@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Rowan County GIS Assistant</title>
     <link rel="stylesheet" href="https://js.arcgis.com/4.29/esri/themes/light/main.css">
-    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}?v=17">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}?v=18">
 </head>
 <body>
     <div class="app-shell">
@@ -22,6 +22,11 @@
             <section class="chat-panel">
                 <div id="chat-messages" class="chat-messages" aria-live="polite"></div>
 
+                <div id="recent-searches" class="recent-searches hidden">
+                    <p class="suggestions-label">Recent:</p>
+                    <div id="recent-buttons" class="suggestion-buttons"></div>
+                </div>
+
                 <div class="suggestions">
                     <p class="suggestions-label">Try asking:</p>
                     <div id="suggestion-buttons" class="suggestion-buttons"></div>
@@ -33,17 +38,26 @@
                         type="text"
                         placeholder="e.g. PIN 1234567890 or 123 Main St Salisbury"
                         autocomplete="off"
+                        list="search-suggestions"
                         required
                     >
+                    <datalist id="search-suggestions"></datalist>
                     <button type="submit" id="chat-submit">Ask</button>
                 </form>
 
                 <p class="privacy-note">
                     Questions are logged anonymously to help improve this service. Result details are not stored.
+                    <span class="keyboard-hint">Press <kbd>/</kbd> to focus search.</span>
                 </p>
             </section>
 
             <section class="map-panel">
+                <div class="map-controls">
+                    <label class="map-toggle">
+                        <input type="checkbox" id="toggle-pictometry" checked>
+                        Aerial imagery
+                    </label>
+                </div>
                 <div id="map-status" class="map-status">Loading map...</div>
                 <div id="map-view"></div>
                 <div id="result-list" class="result-list hidden"></div>
@@ -59,11 +73,13 @@
             portalUrl: {{ portal_url | tojson }},
             queryUrl: {{ url_for('api_query') | tojson }},
             parcelAtPointUrl: {{ url_for('api_parcel_at_point') | tojson }},
-            layersUrl: {{ url_for('api_layers') | tojson }}
+            layersUrl: {{ url_for('api_layers') | tojson }},
+            autocompleteUrl: {{ url_for('api_autocomplete') | tojson }},
+            subdivisionsUrl: {{ url_for('api_subdivisions') | tojson }}
         };
     </script>
     <script src="https://js.arcgis.com/4.29/"></script>
-    <script src="{{ url_for('static', filename='js/map.js') }}?v=46"></script>
-    <script src="{{ url_for('static', filename='js/chat.js') }}?v=29"></script>
+    <script src="{{ url_for('static', filename='js/map.js') }}?v=47"></script>
+    <script src="{{ url_for('static', filename='js/chat.js') }}?v=30"></script>
 </body>
 </html>
